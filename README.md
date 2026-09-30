@@ -68,11 +68,18 @@ startup, before any COPY or MOVE, and a folder another process created first is 
 Each email logs one line to stdout: uid, subject (80 chars), labels, destination and the
 top three probabilities. Bodies are never logged.
 
-Failures. Timeouts, connection errors, 429, 5xx, and 401/402/403/404 from Jev stop the
+Failures. Timeouts, connection errors, 429, 5xx, and 401/402/403/404 from Jev are retried
+in-process three more times after 10, 30 and 90 seconds, then stop the
 process with a non-zero exit, so a supervisor such as Docker restarts it and the email is
 retried. Other 4xx responses, or a body still too long at 2000 characters, give that one
 email the unmatched label and mark it processed, so one bad email cannot wedge the
 watcher. Lost connections exit non-zero as well.
+
+Heartbeat. `watch` and `run` write the current UTC ISO timestamp to a `heartbeat` file
+next to `state_path`: once the IMAP connection is up (`watch`), after every email is
+processed (`--dry-run` included), before each Jev retry sleep, and after every IDLE or
+sleep cycle (`watch`). A host watchdog can restart a process whose heartbeat has gone
+stale, such as one stuck on an IMAP command that never returns.
 
 Order of effects per email: COPY each label, MOVE if there is a destination, then record
 the message in the state file. A crash before the record repeats only idempotent COPYs on

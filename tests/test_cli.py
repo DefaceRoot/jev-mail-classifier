@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -113,10 +114,102 @@ def test_transient_provider_failure_propagates_without_touching_the_mailbox():
     client.decide.side_effect = ProviderError("OpenRouter request failed: 503 Service Unavailable")
 
     with pytest.raises(ProviderError):
-        cli._process_batch(mailbox, store, client, make_config(), 25, False)
+        cli._process_batch(mailbox, store, client, make_config(), 25, False, sleep=lambda seconds: None)
 
     mailbox.apply.assert_not_called()
     store.record.assert_not_called()
+
+
+def _flaky_client(failures: int) -> MagicMock:
+    client = MagicMock()
+    client.decide.side_effect = [ProviderError("OpenRouter request failed: The read operation timed out")] * failures + [
+        probs(receipt=0.9)
+    ]
+    return client
+
+
+def test_transient_failures_are_retried_with_backoff_and_then_succeed(capsys):
+    sleeps = []
+    client = _flaky_client(2)
+
+    decision = cli._decide_for(client, make_config(), _mail(uid=7), sleep=sleeps.append)
+
+    assert decision.labels == ("Labels/JEV-RECEIPT",)
+    assert sleeps == [10, 30]
+    assert client.decide.call_count == 3
+    err_lines = capsys.readouterr().err.splitlines()
+    assert len(err_lines) == 2
+    assert err_lines[0] == (
+        "uid=7 Jev call failed (OpenRouter request failed: The read operation timed out), retry 1/3 in 10s"
+    )
+
+
+def test_transient_failure_that_never_clears_raises_after_four_attempts():
+    sleeps = []
+    client = _flaky_client(99)
+
+    with pytest.raises(ProviderError, match="read operation timed out"):
+        cli._decide_for(client, make_config(), _mail(), sleep=sleeps.append)
+
+    assert client.decide.call_count == 4
+    assert sleeps == [10, 30, 90]
+
+
+@pytest.mark.parametrize("error", [InputTooLong("too long"), EmailRejected("422 Unprocessable")])
+def test_input_specific_failures_are_not_retried(error):
+    sleeps = []
+    client = MagicMock()
+    client.decide.side_effect = error
+
+    decision = cli._decide_for(client, make_config(), _mail(body="x"), sleep=sleeps.append)
+
+    assert decision.labels == ("Labels/JEV-REVIEW",)
+    assert sleeps == []
+    assert client.decide.call_count == 1
+
+
+def test_heartbeat_is_written_before_each_retry_and_after_each_processed_email(tmp_path):
+    heartbeat = tmp_path / "state" / "heartbeat"
+    heartbeat.write_text("2000-01-01T00:00:00+00:00")
+    mailbox = MagicMock()
+    mailbox.fetch_unprocessed.return_value = [_mail()]
+    seen_at_retry = []
+
+    cli._process_batch(
+        mailbox, MagicMock(), _flaky_client(1), make_config(), 25, False, sleep=lambda s: seen_at_retry.append(heartbeat.read_text())
+    )
+
+    assert seen_at_retry[0] > "2000-01-01T00:00:00+00:00"
+    assert heartbeat.read_text() > seen_at_retry[0]
+    assert datetime.fromisoformat(heartbeat.read_text()).utcoffset() == timedelta(0)
+    assert [p.name for p in heartbeat.parent.iterdir()] == ["heartbeat"]
+
+
+def test_dry_run_also_writes_the_heartbeat(tmp_path):
+    mailbox = MagicMock()
+    mailbox.fetch_unprocessed.return_value = [_mail()]
+
+    cli._process_batch(mailbox, MagicMock(), _flaky_client(0), make_config(), 25, True)
+
+    assert (tmp_path / "state" / "heartbeat").exists()
+
+
+def test_watch_stamps_the_heartbeat_once_connected_and_again_after_each_idle_cycle(tmp_path, monkeypatch):
+    heartbeat = tmp_path / "state" / "heartbeat"
+    stamps = []
+    mailbox = MagicMock()
+    mailbox.__enter__.return_value = mailbox
+    mailbox.supports_idle.return_value = True
+    mailbox.idle_check.side_effect = [[], KeyboardInterrupt]
+    monkeypatch.setattr(cli, "Mailbox", lambda cfg, store: mailbox)
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: make_config())
+    monkeypatch.setattr(cli, "get_jev_client", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(cli, "_drain", lambda *a, **k: stamps.append(heartbeat.read_text()))
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_watch(_args("watch"))
+
+    assert len(stamps) == 2 and stamps[0] < stamps[1]
 
 
 def test_drain_loops_until_a_short_batch():

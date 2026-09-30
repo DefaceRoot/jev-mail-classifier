@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import imaplib
+import os
 import sqlite3
 import sys
 import time
+from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from jev_mail.classify import classify, decide
@@ -17,6 +20,16 @@ from jev_mail.store import ProcessedStore
 
 
 MAX_IDLE_SECONDS = 600
+RETRY_DELAYS_SECONDS = (10, 30, 90)
+
+
+def _write_heartbeat(config: AppConfig) -> None:
+    """Atomically stamps `heartbeat` next to state_path with the current UTC
+    time, so a host watchdog can tell a live watcher from a hung one."""
+    path = Path(config.state_path).parent / "heartbeat"
+    tmp = path.with_name("heartbeat.tmp")
+    tmp.write_text(datetime.now(timezone.utc).isoformat())
+    os.replace(tmp, path)
 
 
 def _paths(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -32,15 +45,38 @@ def _load(args: argparse.Namespace) -> AppConfig:
     return config
 
 
-def _decide_for(client: JevClient, config: AppConfig, mail: Email) -> Decision:
+def _classify_with_retry(
+    client: JevClient, config: AppConfig, mail: Email, body_limit: int | None, sleep: Callable[[float], None]
+) -> dict[str, float]:
+    """A plain ProviderError is transient: retry after each delay in
+    RETRY_DELAYS_SECONDS, then let the last one propagate."""
+    for attempt, delay in enumerate(RETRY_DELAYS_SECONDS, start=1):
+        try:
+            return classify(client, config, mail.state(body_limit))
+        except (InputTooLong, EmailRejected):
+            raise
+        except ProviderError as exc:
+            print(
+                f"uid={mail.uid} Jev call failed ({exc}), retry {attempt}/{len(RETRY_DELAYS_SECONDS)} in {delay}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            _write_heartbeat(config)
+            sleep(delay)
+    return classify(client, config, mail.state(body_limit))
+
+
+def _decide_for(
+    client: JevClient, config: AppConfig, mail: Email, sleep: Callable[[float], None] = time.sleep
+) -> Decision:
     """Ask Jev, halving the body until it fits. Mail Jev can't take at all
     gets the unmatched label, so one poison email never wedges the watcher.
-    Transient failures are plain ProviderErrors and propagate."""
+    Transient failures are retried, then propagate."""
     body_limit: int | None = None
     try:
         while True:
             try:
-                return decide(config, classify(client, config, mail.state(body_limit)))
+                return decide(config, _classify_with_retry(client, config, mail, body_limit, sleep))
             except InputTooLong:
                 size = len(mail.body) if body_limit is None else body_limit
                 if size <= MIN_BODY_CHARS:
@@ -61,15 +97,22 @@ def _log_line(mail: Email, decision: Decision, dry_run: bool) -> str:
 
 
 def _process_batch(
-    mailbox: Mailbox, store: ProcessedStore, client: JevClient, config: AppConfig, limit: int, dry_run: bool
+    mailbox: Mailbox,
+    store: ProcessedStore,
+    client: JevClient,
+    config: AppConfig,
+    limit: int,
+    dry_run: bool,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
     emails = mailbox.fetch_unprocessed(limit=limit)
     for mail in emails:
-        decision = _decide_for(client, config, mail)
+        decision = _decide_for(client, config, mail, sleep)
         if not dry_run:
             mailbox.apply(mail.uid, decision)
             store.record(mail.message_key, decision)
         print(_log_line(mail, decision, dry_run), flush=True)
+        _write_heartbeat(config)
     return len(emails)
 
 
@@ -157,6 +200,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     print(f"watching {folders} on {config.mailbox.host} (ctrl-c to stop)...", flush=True)
     try:
         with store, Mailbox(config.mailbox, store) as mailbox:
+            _write_heartbeat(config)
             if not args.dry_run:
                 mailbox.ensure_folders(config.writable_folders())
             while True:
@@ -168,6 +212,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     mailbox.idle_done()
                 else:
                     time.sleep(min(config.mailbox.poll_interval_seconds, MAX_IDLE_SECONDS))
+                _write_heartbeat(config)
     except (OSError, imaplib.IMAP4.error) as exc:
         print(f"error: {_mailbox_error_message(exc, config)}", file=sys.stderr)
         return 1
