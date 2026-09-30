@@ -61,3 +61,35 @@ def test_gmail_templates_nest_labels_and_use_all_mail():
 
     assert decision.labels == ("JEV/COLD",)
     assert decision.destination == "[Gmail]/All Mail"
+
+
+def test_label_threshold_below_disposition_threshold_labels_without_moving():
+    decision = decide(make_config(), probs(phishing=0.68))
+
+    assert decision.labels == ("Labels/JEV-PHISHING",)
+    assert decision.destination is None
+
+
+def test_disposition_threshold_is_inclusive_and_moves_when_cleared():
+    assert decide(make_config(), probs(phishing=0.8)).destination == "Folders/JEV Quarantine"
+    assert decide(make_config(), probs(spam=0.95)).destination == "Archive"
+    assert decide(make_config(), probs(spam=0.85)).destination is None
+
+
+def test_lower_priority_archive_applies_when_higher_category_is_below_its_disposition_threshold():
+    decision = decide(make_config(), probs(phishing=0.68, cold_outreach=0.9))
+
+    assert decision.labels == ("Labels/JEV-PHISHING", "Labels/JEV-COLD")
+    assert decision.destination == "Archive"
+
+
+def test_keep_below_its_disposition_threshold_does_not_block_archive():
+    from dataclasses import replace
+
+    config = make_config()
+    config.categories[config.categories.index(next(c for c in config.categories if c.name == "action"))] = replace(
+        next(c for c in config.categories if c.name == "action"), disposition_threshold=0.95
+    )
+
+    assert decide(config, probs(action=0.9, cold_outreach=0.9)).destination == "Archive"
+    assert decide(config, probs(action=0.96, cold_outreach=0.9)).destination is None

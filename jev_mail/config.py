@@ -27,6 +27,7 @@ class Category:
     description: str
     threshold: float | None = None
     disposition: Disposition | None = None
+    disposition_threshold: float | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,13 @@ class AppConfig:
     def category_threshold(self, category: Category) -> float:
         return category.threshold if category.threshold is not None else self.jev.default_threshold
 
+    def disposition_threshold(self, category: Category) -> float:
+        """Confidence needed for the category's disposition to take effect;
+        defaults to the threshold that earns its label."""
+        if category.disposition_threshold is not None:
+            return category.disposition_threshold
+        return self.category_threshold(category)
+
     def label_folder(self, label: str) -> str:
         return self.mailbox.label_folder.format(label=label)
 
@@ -98,12 +106,16 @@ def _parse_category(raw: object) -> Category:
             f"category {raw['name']!r} has disposition {disposition!r}; expected one of {', '.join(DISPOSITIONS)}"
         )
     threshold = raw.get("threshold")
+    disposition_threshold = raw.get("disposition_threshold")
+    if disposition_threshold is not None and disposition is None:
+        raise ConfigError(f"category {raw['name']!r} sets disposition_threshold without a disposition")
     return Category(
         name=raw["name"],
         label=raw["label"],
         description=raw["description"],
         threshold=float(threshold) if threshold is not None else None,
         disposition=disposition,
+        disposition_threshold=float(disposition_threshold) if disposition_threshold is not None else None,
     )
 
 
@@ -161,6 +173,12 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
     if len(set(names)) != len(names):
         raise ConfigError("category names must be unique")
     for category in categories:
+        label_threshold = category.threshold if category.threshold is not None else jev.default_threshold
+        if category.disposition_threshold is not None and category.disposition_threshold < label_threshold:
+            raise ConfigError(
+                f"category {category.name!r} has disposition_threshold {category.disposition_threshold} "
+                f"below its label threshold {label_threshold}"
+            )
         if category.disposition in ("archive", "quarantine") and category.disposition not in mailbox.folders:
             raise ConfigError(
                 f"category {category.name!r} uses disposition {category.disposition!r} "

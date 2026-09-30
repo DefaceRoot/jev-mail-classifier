@@ -37,14 +37,22 @@ mailbox:
 
 unmatched_label: REVIEW # applied when no category clears its threshold
 
-# Ordered by priority: the first matching category that has a disposition
-# decides where the email goes. Every matching category still adds its label.
+# Ordered by priority: the first matching category that has a disposition and
+# clears its disposition_threshold decides where the email goes. Every category
+# that clears `threshold` still adds its label. disposition_threshold is optional,
+# defaults to the category's own threshold, and may not be lower than it.
 categories:
   - name: scam
     label: SCAM
     description: "Scam, phishing, or fraud: fake government or compliance notices (USDOT, FMCSA, MCS-150), advance-fee pitches, credential harvesting"
     threshold: 0.8
     disposition: quarantine
+  - name: phishing
+    label: PHISHING
+    description: "Probable phishing: lookalike sender, urgent account or payment pressure, suspicious links"
+    threshold: 0.5 # worth a label at 0.5...
+    disposition: quarantine
+    disposition_threshold: 0.8 # ...but only quarantined at 0.8
   - name: security
     label: SECURITY
     description: "Security alert or verification code from a service the recipient really uses"
@@ -61,6 +69,12 @@ categories:
     label: NEWSLETTER
     description: "Newsletter, digest, or promotional mailing the recipient subscribed to"
     disposition: archive
+  - name: spam
+    label: SPAM
+    description: "Obvious spam"
+    threshold: 0.7
+    disposition: archive
+    disposition_threshold: 0.9 # labelled at 0.7, archived only at very high confidence
   - name: receipt
     label: RECEIPT
     description: "Receipt, invoice, or payment confirmation"

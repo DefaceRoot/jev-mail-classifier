@@ -8,9 +8,11 @@ GMAIL_FOLDERS = {"archive": "[Gmail]/All Mail", "quarantine": "JEV/QUARANTINE"}
 CATEGORIES = [
     Category("scam", "SCAM", "Scam or phishing", threshold=0.8, disposition="quarantine"),
     Category("security", "SECURITY", "Security alert", disposition="quarantine"),
+    Category("phishing", "PHISHING", "Likely phishing", threshold=0.5, disposition="quarantine", disposition_threshold=0.8),
     Category("action", "ACTION", "Needs a reply from me", disposition="keep"),
     Category("cold_outreach", "COLD", "Cold sales pitch", disposition="archive"),
     Category("receipt", "RECEIPT", "Receipt or invoice"),
+    Category("spam", "SPAM", "Spam", threshold=0.7, disposition="archive", disposition_threshold=0.9),
 ]
 
 

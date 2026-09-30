@@ -48,6 +48,7 @@ categories:
     description: "Scam"
     threshold: 0.8
     disposition: quarantine
+    disposition_threshold: 0.9
   - name: receipt
     label: RECEIPT
     description: "Receipt"
@@ -63,6 +64,7 @@ categories:
         ("scam", "SCAM", 0.8, "quarantine"),
         ("receipt", "RECEIPT", None, None),
     ]
+    assert [c.disposition_threshold for c in config.categories] == [0.9, None]
 
 
 def test_defaults(tmp_path):
@@ -84,6 +86,8 @@ def test_defaults(tmp_path):
         (MINIMAL + "    disposition: delete\n", "disposition"),
         (MINIMAL + "    disposition: quarantine\n", "mailbox.folders.quarantine"),
         (MINIMAL.replace("host: imap.example.com", "host: x\n  label_folder: JEV"), "{label}"),
+        (MINIMAL + "    threshold: 0.6\n    disposition: archive\n    disposition_threshold: 0.5\n", "below its label threshold"),
+        (MINIMAL + "    disposition_threshold: 0.9\n", "without a disposition"),
         (MINIMAL + '  - name: scam\n    label: X\n    description: "dup"\n', "unique"),
     ],
 )

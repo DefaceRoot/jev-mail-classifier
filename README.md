@@ -83,6 +83,7 @@ categories:
     description: "Scam or phishing"
     threshold: 0.8            # optional, default is jev.default_threshold
     disposition: quarantine   # optional: keep | archive | quarantine
+    disposition_threshold: 0.9  # optional, see below
 ```
 
 **Labels.** Every category that clears its threshold adds its label, in priority order.
@@ -91,7 +92,11 @@ If none does, the email gets the `unmatched_label`. Labels are IMAP folders name
 the message stays where it is.
 
 **Dispositions.** The first matched category, in priority order, that has a disposition
-decides the single move. `archive` and `quarantine` move to `mailbox.folders.archive` and
+and whose probability also clears its `disposition_threshold` decides the single move.
+`disposition_threshold` defaults to the category's own threshold and may not be lower
+than it, so a category can label at 0.5 but only quarantine at 0.8. A labelled category
+below its disposition threshold has no say, so lower-priority categories can still move
+the email. `archive` and `quarantine` move to `mailbox.folders.archive` and
 `mailbox.folders.quarantine`. `keep` means no move and blocks lower-priority archive or
 quarantine. A category with no disposition has no opinion. The marker is set before the
 MOVE, so a crash never reprocesses a moved message.
