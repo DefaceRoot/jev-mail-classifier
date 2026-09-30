@@ -51,7 +51,6 @@ def test_nothing_clears_threshold_gets_review_label_and_stays():
 
 
 def test_category_threshold_overrides_default_and_is_inclusive():
-    # scam has threshold 0.8, security falls back to the 0.7 default
     assert decide(make_config(), probs(scam=0.8)).labels == ("Labels/JEV-SCAM",)
     assert decide(make_config(), probs(security=0.7)).labels == ("Labels/JEV-SECURITY",)
 

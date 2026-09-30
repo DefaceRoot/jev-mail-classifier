@@ -10,11 +10,6 @@ def classify(client: JevClient, config: AppConfig, state: str) -> dict[str, floa
 
 
 def decide(config: AppConfig, probabilities: dict[str, float]) -> Decision:
-    """Every category that clears its threshold contributes a label. The first
-    category in config (= priority) order that has a disposition and clears its
-    disposition_threshold picks the single destination, so there is at most one
-    move per email. `keep` is a disposition that means "stay put" and, being
-    first, shadows lower-priority archive/quarantine."""
     matched = [c for c in config.categories if probabilities[c.name] >= config.category_threshold(c)]
     labels = tuple(config.label_folder(c.label) for c in matched) or (config.label_folder(config.unmatched_label),)
     disposition = next(

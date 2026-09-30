@@ -13,6 +13,7 @@ from jev_mail.mailbox import PROCESSED_KEYWORD, Mailbox
 from jev_mail.providers import EmailRejected, InputTooLong, ProviderError, get_jev_client
 from jev_mail.providers.base import JevClient
 
+
 class MarkerNotSticking(Exception):
     """The same UID came back as unprocessed after being handled."""
 

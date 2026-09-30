@@ -32,9 +32,6 @@ class Category:
 
 @dataclass(frozen=True)
 class Decision:
-    """What to do with one email. `labels` and `destination` are full IMAP
-    folder names; `destination` is None when the message stays where it is."""
-
     labels: tuple[str, ...]
     destination: str | None
     probabilities: dict[str, float] = field(default_factory=dict)
@@ -74,8 +71,6 @@ class AppConfig:
         return category.threshold if category.threshold is not None else self.jev.default_threshold
 
     def disposition_threshold(self, category: Category) -> float:
-        """Confidence needed for the category's disposition to take effect;
-        defaults to the threshold that earns its label."""
         if category.disposition_threshold is not None:
             return category.disposition_threshold
         return self.category_threshold(category)

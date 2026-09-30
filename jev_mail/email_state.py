@@ -16,8 +16,6 @@ MIN_BODY_CHARS = 2000
 
 @dataclass(frozen=True)
 class Email:
-    """One message as Jev sees it: a header block plus the full text body."""
-
     uid: int
     subject: str
     headers: str
