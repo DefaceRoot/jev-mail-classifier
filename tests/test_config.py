@@ -1,88 +1,102 @@
-import os
-
 import pytest
 
-from jev_mail.config import (
-    AppConfig,
-    Category,
-    ConfigError,
-    JevSettings,
-    MailboxConfig,
-    load_config,
-)
+from jev_mail.config import ConfigError, load_config
+
+MINIMAL = """
+mailbox:
+  host: imap.example.com
+categories:
+  - name: scam
+    label: SCAM
+    description: "Scam"
+"""
 
 
-def test_load_config_interpolates_env_and_parses_categories(tmp_path, monkeypatch):
+def _load(tmp_path, text):
+    path = tmp_path / "config.yaml"
+    path.write_text(text)
+    return load_config(path, env_path=tmp_path / "missing.env")
+
+
+def test_load_full_contract_shape(tmp_path, monkeypatch):
     monkeypatch.setenv("IMAP_USERNAME", "me@example.com")
     monkeypatch.setenv("IMAP_PASSWORD", "secret")
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
+    config = _load(
+        tmp_path,
         """
+jev:
+  provider: openrouter
+  model: typesafe/jev-1.13
+  default_threshold: 0.7
 mailbox:
-  host: imap.example.com
+  host: bridge
+  port: 143
+  security: starttls
+  tls_verify: false
   username: ${IMAP_USERNAME}
   password: ${IMAP_PASSWORD}
-jev:
-  default_threshold: 0.7
+  batch_size: 10
+  max_fetch_bytes: 1000
+  label_folder: "Labels/JEV-{label}"
+  folders:
+    archive: Archive
+    quarantine: "Folders/JEV Quarantine"
+unmatched_label: REVIEW
 categories:
-  invoice:
-    description: "Invoice or billing"
-"""
+  - name: scam
+    label: SCAM
+    description: "Scam"
+    threshold: 0.8
+    disposition: quarantine
+  - name: receipt
+    label: RECEIPT
+    description: "Receipt"
+""",
     )
 
-    config = load_config(config_path, env_path=tmp_path / "does-not-exist.env")
+    mb = config.mailbox
+    assert (mb.host, mb.port, mb.security, mb.tls_verify) == ("bridge", 143, "starttls", False)
+    assert (mb.username, mb.password, mb.batch_size, mb.max_fetch_bytes) == ("me@example.com", "secret", 10, 1000)
+    assert mb.folders == {"archive": "Archive", "quarantine": "Folders/JEV Quarantine"}
+    assert config.jev.model == "typesafe/jev-1.13"
+    assert [(c.name, c.label, c.threshold, c.disposition) for c in config.categories] == [
+        ("scam", "SCAM", 0.8, "quarantine"),
+        ("receipt", "RECEIPT", None, None),
+    ]
 
-    assert config.mailbox.username == "me@example.com"
-    assert config.mailbox.password == "secret"
+
+def test_defaults(tmp_path):
+    config = _load(tmp_path, MINIMAL)
+
+    assert config.mailbox.tls_verify is True
+    assert config.mailbox.batch_size == 25
+    assert config.mailbox.poll_interval_seconds == 600
+    assert config.unmatched_label == "REVIEW"
     assert config.jev.default_threshold == 0.7
-    assert len(config.categories) == 1
-    assert config.categories[0].name == "invoice"
 
 
-def test_load_config_max_emails_per_run_defaults_and_overrides(tmp_path):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text('mailbox:\n  host: imap.example.com\ncategories:\n  spam:\n    description: spam\n    actions: []\n')
-    config = load_config(config_path, env_path=tmp_path / "does-not-exist.env")
-    assert config.mailbox.max_emails_per_run == 25
-
-    config_path.write_text(
-        "mailbox:\n  host: imap.example.com\n  max_emails_per_run: 5\n"
-        "categories:\n  spam:\n    description: spam\n    actions: []\n"
-    )
-    config = load_config(config_path, env_path=tmp_path / "does-not-exist.env")
-    assert config.mailbox.max_emails_per_run == 5
-
-
-def test_load_config_empty_host_raises(tmp_path):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text("mailbox:\n  host: ''\ncategories:\n  spam:\n    description: spam\n    actions: []\n")
-    with pytest.raises(ConfigError):
-        load_config(config_path, env_path=tmp_path / "does-not-exist.env")
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ("mailbox:\n  host: ''\ncategories: []\n", "mailbox.host"),
+        (MINIMAL.replace("host: imap.example.com", "host: x\n  security: tls"), "security"),
+        (MINIMAL.replace("categories:\n  - name: scam\n    label: SCAM\n    description: \"Scam\"\n", "categories:\n  scam:\n    description: x\n"), "list"),
+        (MINIMAL + "    disposition: delete\n", "disposition"),
+        (MINIMAL + "    disposition: quarantine\n", "mailbox.folders.quarantine"),
+        (MINIMAL.replace("host: imap.example.com", "host: x\n  label_folder: JEV"), "{label}"),
+        (MINIMAL + '  - name: scam\n    label: X\n    description: "dup"\n', "unique"),
+    ],
+)
+def test_invalid_configs_are_rejected(tmp_path, text, message):
+    with pytest.raises(ConfigError, match=message):
+        _load(tmp_path, text)
 
 
-def test_load_config_missing_env_var_raises(tmp_path):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        """
-mailbox:
-  host: imap.example.com
-  username: ${DEFINITELY_NOT_SET}
-categories:
-  spam:
-    description: spam
-"""
-    )
-    with pytest.raises(ConfigError):
-        load_config(config_path, env_path=tmp_path / "does-not-exist.env")
+def test_missing_env_var_raises(tmp_path):
+    with pytest.raises(ConfigError, match="DEFINITELY_NOT_SET"):
+        _load(tmp_path, MINIMAL.replace("host: imap.example.com", "host: x\n  username: ${DEFINITELY_NOT_SET}"))
 
 
-def test_load_config_no_categories_raises(tmp_path):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text("mailbox:\n  host: imap.example.com\ncategories: {}\n")
-    with pytest.raises(ConfigError):
-        load_config(config_path, env_path=tmp_path / "does-not-exist.env")
-
-
-def test_load_config_missing_file_raises(tmp_path):
+def test_missing_file_raises(tmp_path):
     with pytest.raises(ConfigError):
         load_config(tmp_path / "nope.yaml")

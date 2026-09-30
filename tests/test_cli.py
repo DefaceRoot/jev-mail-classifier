@@ -1,16 +1,11 @@
 from unittest.mock import MagicMock
 
 import jev_mail.cli as cli
-from jev_mail.config import AppConfig, Category, JevSettings, MailboxConfig
+from tests.factories import make_config, probs
 from jev_mail.mailbox import Email
 
 
-def _config() -> AppConfig:
-    return AppConfig(
-        mailbox=MailboxConfig(host="imap.example.com"),
-        jev=JevSettings(default_threshold=0.6),
-        categories=[Category(name="invoice", description="Invoice")],
-    )
+_config = make_config
 
 
 def test_build_parser_defaults_and_dry_run_flag():
@@ -32,7 +27,7 @@ def test_process_unprocessed_passes_limit_to_fetch():
     client = MagicMock()
 
     config = _config()
-    config.mailbox.max_emails_per_run = 7
+    config.mailbox.batch_size = 7
     cli._process_unprocessed(mailbox, client, config, dry_run=False)
 
     mailbox.fetch_unprocessed.assert_called_once_with(limit=7)
@@ -42,20 +37,20 @@ def test_process_unprocessed_warns_when_limit_is_hit(capsys):
     mailbox = MagicMock()
     mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="One", body="body")]
     client = MagicMock()
-    client.decide.return_value = {"invoice": 0.9}
+    client.decide.return_value = probs(receipt=0.9)
 
     config = _config()
-    config.mailbox.max_emails_per_run = 1
+    config.mailbox.batch_size = 1
     cli._process_unprocessed(mailbox, client, config, dry_run=False)
 
-    assert "max_emails_per_run" in capsys.readouterr().out
+    assert "batch_size" in capsys.readouterr().out
 
 
 def test_process_unprocessed_dry_run_does_not_mutate_mailbox(capsys):
     mailbox = MagicMock()
     mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Invoice #1", body="Please pay")]
     client = MagicMock()
-    client.decide.return_value = {"invoice": 0.9}
+    client.decide.return_value = probs(receipt=0.9)
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=True)
 
@@ -67,7 +62,7 @@ def test_process_unprocessed_marks_processed():
     mailbox = MagicMock()
     mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Invoice #1", body="Please pay")]
     client = MagicMock()
-    client.decide.return_value = {"invoice": 0.9}
+    client.decide.return_value = probs(receipt=0.9)
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=False)
 
@@ -78,7 +73,7 @@ def test_process_unprocessed_below_threshold_no_actions():
     mailbox = MagicMock()
     mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Newsletter", body="...")]
     client = MagicMock()
-    client.decide.return_value = {"invoice": 0.1}
+    client.decide.return_value = probs()
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=False)
 

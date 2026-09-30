@@ -118,3 +118,10 @@ def test_get_jev_client_explicit_provider_missing_key_raises():
 def test_get_jev_client_explicit_provider_unknown_raises():
     with pytest.raises(ProviderError):
         get_jev_client(JevSettings(provider="not-a-real-provider"), env={"TYPESAFE_API_KEY": "x"})
+
+
+def test_get_jev_client_passes_configured_model_to_openrouter():
+    client = get_jev_client(
+        JevSettings(provider="openrouter", model="typesafe/jev-9.9"), env={"OPENROUTER_API_KEY": "or-key"}
+    )
+    assert client._model == "typesafe/jev-9.9"

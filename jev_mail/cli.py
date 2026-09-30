@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from jev_mail.classify import classify, matched_categories
+from jev_mail.classify import classify, decide
 from jev_mail.config import AppConfig, ConfigError, load_config
 from jev_mail.mailbox import Mailbox
 from jev_mail.providers import ProviderError, get_jev_client
@@ -19,19 +19,18 @@ def _paths(args: argparse.Namespace) -> tuple[Path, Path]:
 
 
 def _process_unprocessed(mailbox: Mailbox, client: JevClient, config: AppConfig, dry_run: bool) -> None:
-    emails = mailbox.fetch_unprocessed(limit=config.mailbox.max_emails_per_run)
-    if len(emails) == config.mailbox.max_emails_per_run:
+    emails = mailbox.fetch_unprocessed(limit=config.mailbox.batch_size)
+    if len(emails) == config.mailbox.batch_size:
         print(
-            f"[jev-mail] hit max_emails_per_run ({config.mailbox.max_emails_per_run}) -- "
+            f"[jev-mail] hit batch_size ({config.mailbox.batch_size}) -- "
             "there may be more unprocessed mail left for next run"
         )
     for mail in emails:
         probabilities = classify(client, config, mail.state)
-        matched = matched_categories(config, probabilities)
+        decision = decide(config, probabilities)
 
         if dry_run:
-            names = ", ".join(f"{c.name} ({probabilities[c.name]:.2f})" for c in matched) or "no category matched"
-            print(f"[dry-run] {mail.subject!r}: {names}")
+            print(f"[dry-run] {mail.subject!r}: {', '.join(decision.labels)} -> {decision.destination}")
 
         # Mark processed even when nothing matched -- otherwise a never-matching
         # email gets reclassified (and re-billed) on every future run.
