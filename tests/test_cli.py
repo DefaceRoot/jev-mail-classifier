@@ -10,7 +10,7 @@ from tests.factories import make_config, probs
 
 
 def _mail(uid=1, subject="Invoice #1", body="Please pay") -> Email:
-    return Email(uid=uid, subject=subject, headers=f"Subject: {subject}", body=body)
+    return Email(uid=uid, subject=subject, headers=f"Subject: {subject}", body=body, message_key=f"key-{uid}@x")
 
 
 def _args(*argv: str):
@@ -35,17 +35,19 @@ def test_limit_without_dry_run_is_rejected(monkeypatch):
 
 def test_batch_applies_decision_and_logs_one_line_without_body(capsys):
     mailbox = MagicMock()
+    store = MagicMock()
     mailbox.fetch_unprocessed.return_value = [_mail(uid=9, subject="S" * 100, body="TOP SECRET BODY")]
     client = MagicMock()
     client.decide.return_value = probs(scam=0.91, security=0.4, receipt=0.75, action=0.1)
 
-    cli._process_batch(mailbox, client, make_config(), "INBOX", 25, False, set())
+    cli._process_batch(mailbox, store, client, make_config(), 25, False)
 
     decision = mailbox.apply.call_args.args[1]
     assert mailbox.apply.call_args.args[0] == 9
     assert decision.labels == ("Labels/JEV-SCAM", "Labels/JEV-RECEIPT")
     assert decision.destination == "Folders/JEV Quarantine"
     out = capsys.readouterr().out
+    store.record.assert_called_once_with("key-9@x", decision)
     assert out == (
         f"uid=9 subject={'S' * 80!r} labels=Labels/JEV-SCAM,Labels/JEV-RECEIPT "
         "dest=Folders/JEV Quarantine top=scam:0.91 receipt:0.75 security:0.40\n"
@@ -91,26 +93,30 @@ def test_body_still_too_long_at_the_floor_gets_review_label(capsys):
 
 def test_poison_email_is_labelled_review_and_marked_processed_and_batch_continues():
     mailbox = MagicMock()
+    store = MagicMock()
     mailbox.fetch_unprocessed.return_value = [_mail(uid=2, subject="poison"), _mail(uid=1, subject="fine")]
     client = MagicMock()
     client.decide.side_effect = [EmailRejected("422 Unprocessable"), probs(receipt=0.9)]
 
-    cli._process_batch(mailbox, client, make_config(), "INBOX", 25, False, set())
+    cli._process_batch(mailbox, store, client, make_config(), 25, False)
 
     applied = [(c.args[0], c.args[1].labels, c.args[1].destination) for c in mailbox.apply.call_args_list]
     assert applied == [(2, ("Labels/JEV-REVIEW",), None), (1, ("Labels/JEV-RECEIPT",), None)]
+    assert [c.args[0] for c in store.record.call_args_list] == ["key-2@x", "key-1@x"]
 
 
 def test_transient_provider_failure_propagates_without_touching_the_mailbox():
     mailbox = MagicMock()
+    store = MagicMock()
     mailbox.fetch_unprocessed.return_value = [_mail()]
     client = MagicMock()
     client.decide.side_effect = ProviderError("OpenRouter request failed: 503 Service Unavailable")
 
     with pytest.raises(ProviderError):
-        cli._process_batch(mailbox, client, make_config(), "INBOX", 25, False, set())
+        cli._process_batch(mailbox, store, client, make_config(), 25, False)
 
     mailbox.apply.assert_not_called()
+    store.record.assert_not_called()
 
 
 def test_drain_loops_until_a_short_batch():
@@ -123,22 +129,10 @@ def test_drain_loops_until_a_short_batch():
     client = MagicMock()
     client.decide.return_value = probs()
 
-    cli._drain(mailbox, client, make_config(batch_size=2), False, set())
+    cli._drain(mailbox, MagicMock(), client, make_config(batch_size=2), False)
 
     assert mailbox.fetch_unprocessed.call_count == 3
     assert [c.args[0] for c in mailbox.apply.call_args_list] == [5, 4, 3, 2, 1]
-
-
-def test_drain_stops_when_the_server_keeps_returning_handled_mail():
-    mailbox = MagicMock()
-    mailbox.fetch_unprocessed.return_value = [_mail(uid=2), _mail(uid=1)]
-    client = MagicMock()
-    client.decide.return_value = probs()
-
-    with pytest.raises(cli.MarkerNotSticking, match=r"'INBOX' uids \[1, 2\]"):
-        cli._drain(mailbox, client, make_config(batch_size=2), False, set())
-
-    assert client.decide.call_count == 2
 
 
 def _folder_mailbox(mails_by_folder: dict[str, list[list[Email]]]) -> MagicMock:
@@ -161,23 +155,10 @@ def test_drain_visits_watch_folders_in_order_and_applies_inside_each():
     config = make_config(batch_size=2)
     config.mailbox.watch_folders = ["INBOX", "Folders/Bay Bravo"]
 
-    cli._drain(mailbox, client, config, False, set())
+    cli._drain(mailbox, MagicMock(), client, config, False)
 
     assert [c.args[0] for c in mailbox.select.call_args_list] == ["INBOX", "Folders/Bay Bravo"]
     assert mailbox.applied == [("INBOX", 2), ("INBOX", 1), ("Folders/Bay Bravo", 1)]
-
-
-def test_same_uid_in_two_folders_is_not_a_stuck_marker():
-    mailbox = _folder_mailbox({"INBOX": [[_mail(uid=1)]], "Folders/Bay Bravo": [[_mail(uid=1)]]})
-    client = MagicMock()
-    client.decide.return_value = probs()
-    config = make_config()
-    config.mailbox.watch_folders = ["INBOX", "Folders/Bay Bravo"]
-    done: set = set()
-
-    cli._drain(mailbox, client, config, False, done)
-
-    assert done == {("INBOX", 1), ("Folders/Bay Bravo", 1)}
 
 
 def test_dry_run_takes_one_batch_per_folder():
@@ -187,7 +168,7 @@ def test_dry_run_takes_one_batch_per_folder():
     config = make_config(batch_size=1)
     config.mailbox.watch_folders = ["INBOX", "Archive"]
 
-    cli._drain(mailbox, client, config, True, set())
+    cli._drain(mailbox, MagicMock(), client, config, True)
 
     assert mailbox.fetch_unprocessed.call_count == 2
     mailbox.apply.assert_not_called()
@@ -198,7 +179,7 @@ def test_run_creates_all_writable_folders_before_any_fetch_and_dry_run_creates_n
     mailbox = MagicMock()
     mailbox.__enter__.return_value = mailbox
     mailbox.ensure_folders.side_effect = lambda names: order.append(("ensure", list(names)))
-    monkeypatch.setattr(cli, "Mailbox", lambda cfg: mailbox)
+    monkeypatch.setattr(cli, "Mailbox", lambda cfg, store: mailbox)
     monkeypatch.setattr(cli, "load_config", lambda *a, **k: make_config())
     monkeypatch.setattr(cli, "get_jev_client", lambda *a, **k: MagicMock())
     monkeypatch.setattr(cli, "_drain", lambda *a, **k: order.append(("drain",)))
@@ -223,7 +204,7 @@ def test_watch_idles_on_first_folder_after_draining_all(monkeypatch):
     mailbox.idle_check.side_effect = [[], KeyboardInterrupt]
     config = make_config(poll_interval_seconds=3000)
     config.mailbox.watch_folders = ["INBOX", "Folders/Bay Bravo"]
-    monkeypatch.setattr(cli, "Mailbox", lambda cfg: mailbox)
+    monkeypatch.setattr(cli, "Mailbox", lambda cfg, store: mailbox)
     monkeypatch.setattr(cli, "load_config", lambda *a, **k: config)
     monkeypatch.setattr(cli, "get_jev_client", lambda *a, **k: MagicMock())
     monkeypatch.setattr(cli, "_drain", lambda *a, **k: events.append(("drain",)))
@@ -241,10 +222,12 @@ def test_dry_run_processes_one_batch_of_the_limit_and_never_writes(capsys):
     client = MagicMock()
     client.decide.return_value = probs(receipt=0.9)
 
-    cli._drain(mailbox, client, make_config(batch_size=25), True, set(), limit=3)
+    store = MagicMock()
+    cli._drain(mailbox, store, client, make_config(batch_size=25), True, limit=3)
 
     mailbox.fetch_unprocessed.assert_called_once_with(limit=3)
     mailbox.apply.assert_not_called()
+    store.record.assert_not_called()
     assert capsys.readouterr().out.count("[dry-run] uid=") == 3
 
 
@@ -261,17 +244,14 @@ def test_cmd_run_reports_config_error(monkeypatch, capsys):
 
 
 class _FakeMailbox:
-    """Stands in for Mailbox; class-level state survives reconnects."""
+    """Stands in for Mailbox. It has no write methods except ensure_folders,
+    so `check` touching the mailbox would raise AttributeError."""
 
-    keywords_persist = True
     missing: set = set()
-    unprocessed = [3, 2]
-    newest = 3
-    store: set = set()
-    selected_folders: list = []
+    selected: list = []
 
-    def __init__(self, config):
-        self.config = config
+    def __init__(self, config, store):
+        self.store = store
 
     def __enter__(self):
         return self
@@ -280,29 +260,16 @@ class _FakeMailbox:
         return False
 
     def select(self, folder):
-        _FakeMailbox.selected_folders.append(folder)
+        _FakeMailbox.selected.append(folder)
 
     def capabilities(self):
         return ["IDLE", "MOVE"]
 
-    def unprocessed_uids(self):
-        return self.unprocessed
+    def counts(self):
+        return (10, 3) if self.selected[-1] == "INBOX" else (4, 4)
 
     def folder_exists(self, name):
         return name not in self.missing
-
-    def newest_uid(self):
-        return self.newest
-
-    def add_keyword(self, uid, kw):
-        _FakeMailbox.store.add((self.selected_folders[-1], uid, kw))
-
-    def keywords(self, uid):
-        folder = self.selected_folders[-1]
-        return {kw for f, u, kw in _FakeMailbox.store if (f, u) == (folder, uid)} if self.keywords_persist else set()
-
-    def remove_keyword(self, uid, kw):
-        _FakeMailbox.store.discard((self.selected_folders[-1], uid, kw))
 
     def ensure_folders(self, names):
         pass
@@ -310,33 +277,26 @@ class _FakeMailbox:
 
 @pytest.fixture
 def fake_mailbox(monkeypatch):
-    for name, value in dict(keywords_persist=True, missing=set(), newest=3).items():
-        monkeypatch.setattr(_FakeMailbox, name, value)
-    monkeypatch.setattr(_FakeMailbox, "store", set())
-    monkeypatch.setattr(_FakeMailbox, "selected_folders", [])
+    monkeypatch.setattr(_FakeMailbox, "missing", set())
+    monkeypatch.setattr(_FakeMailbox, "selected", [])
     monkeypatch.setattr(cli, "Mailbox", _FakeMailbox)
     monkeypatch.setattr(cli, "load_config", lambda *a, **k: make_config(watch_folders=["INBOX", "Folders/Bay Bravo"]))
     return _FakeMailbox
 
 
-def test_check_passes_reports_each_folder_and_probes_the_first_only(fake_mailbox, capsys):
+def test_check_reports_counts_per_folder_and_writes_nothing(fake_mailbox, capsys):
+    from jev_mail.store import ProcessedStore
+    from tests import factories
+
     assert cli.cmd_check(_args("check")) == 0
 
     out = capsys.readouterr().out
     assert "capabilities: IDLE MOVE" in out
-    assert "'INBOX': 2 unprocessed messages" in out
-    assert "'Folders/Bay Bravo': 2 unprocessed messages" in out
-    assert fake_mailbox.store == set()
-    assert fake_mailbox.selected_folders == ["INBOX", "Folders/Bay Bravo", "INBOX", "INBOX"]
-
-
-def test_check_fails_when_keywords_do_not_persist_and_still_cleans_up(fake_mailbox, monkeypatch, capsys):
-    monkeypatch.setattr(_FakeMailbox, "keywords_persist", False)
-
-    assert cli.cmd_check(_args("check")) == 1
-
-    assert "$JevProbe did not persist" in capsys.readouterr().err
-    assert fake_mailbox.store == set()
+    assert "'INBOX': 10 messages, 3 unprocessed" in out
+    assert "'Folders/Bay Bravo': 4 messages, 4 unprocessed" in out
+    assert out.strip().endswith("is writable")
+    with ProcessedStore(factories.DEFAULT_STATE_PATH) as store:
+        assert store.processed_count() == 0
 
 
 def test_check_fails_when_a_watch_folder_is_missing(fake_mailbox, monkeypatch, capsys):
@@ -355,18 +315,25 @@ def test_check_fails_when_archive_folder_is_missing(fake_mailbox, monkeypatch, c
     assert "folders.archive 'Archive' does not exist" in capsys.readouterr().err
 
 
-def test_check_fails_on_an_empty_probe_folder(fake_mailbox, monkeypatch, capsys):
-    monkeypatch.setattr(_FakeMailbox, "newest", None)
+def test_check_fails_when_the_state_path_is_not_writable(fake_mailbox, monkeypatch, tmp_path, capsys):
+    blocker = tmp_path / "file-not-dir"
+    blocker.write_text("x")
+    config = make_config(state_path=str(blocker / "jev-mail.sqlite"))
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: config)
 
     assert cli.cmd_check(_args("check")) == 1
 
-    assert "'INBOX' is empty" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert f"state_path {str(blocker / 'jev-mail.sqlite')!r} is not writable" in captured.err
+    assert "unprocessed" not in captured.out
 
 
 def test_folder_flags_replace_configured_watch_folders(fake_mailbox, monkeypatch):
     seen = []
     monkeypatch.setattr(cli, "get_jev_client", lambda *a, **k: MagicMock())
-    monkeypatch.setattr(cli, "_drain", lambda mailbox, client, config, *a, **k: seen.append(config.mailbox.watch_folders))
+    monkeypatch.setattr(
+        cli, "_drain", lambda mailbox, store, client, config, *a, **k: seen.append(config.mailbox.watch_folders)
+    )
 
     cli.cmd_run(_args("--folder", "Folders/Bay Bravo", "--folder", "Archive", "--folder", "Archive", "run"))
     cli.cmd_run(_args("run"))
@@ -379,7 +346,7 @@ def test_cmd_run_reports_connection_error_not_a_traceback(monkeypatch, capsys):
     monkeypatch.setattr(cli, "get_jev_client", lambda *a, **k: MagicMock())
 
     class RefusingMailbox:
-        def __init__(self, mailbox_config):
+        def __init__(self, mailbox_config, store):
             pass
 
         def __enter__(self):
@@ -409,3 +376,14 @@ def test_cmd_run_exits_nonzero_on_transient_provider_failure(monkeypatch, capsys
 
     assert cli.cmd_run(_args("run")) == 1
     assert "429" in capsys.readouterr().err
+
+
+def test_cmd_run_reports_an_unusable_state_path_before_connecting(monkeypatch, tmp_path, capsys):
+    blocker = tmp_path / "file-not-dir"
+    blocker.write_text("x")
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: make_config(state_path=str(blocker / "s.sqlite")))
+    monkeypatch.setattr(cli, "get_jev_client", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(cli, "Mailbox", lambda *a: pytest.fail("connected despite unusable state_path"))
+
+    assert cli.cmd_run(_args("run")) == 1
+    assert "can't open state_path" in capsys.readouterr().err

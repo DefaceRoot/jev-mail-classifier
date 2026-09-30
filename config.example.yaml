@@ -39,6 +39,11 @@ mailbox:
 
 unmatched_label: REVIEW # applied when no category clears its threshold
 
+# SQLite file recording which messages were sorted, keyed on Message-ID. It is the
+# only record, so keep it on a persistent volume (Docker: mount /state). One file per
+# account; the parent directory is created if missing.
+state_path: /state/jev-mail.sqlite
+
 # Ordered by priority: the first matching category that has a disposition and
 # clears its disposition_threshold decides where the email goes. Every category
 # that clears `threshold` still adds its label. disposition_threshold is optional,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import email
 import email.policy
+import hashlib
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -20,10 +21,22 @@ class Email:
     subject: str
     headers: str
     body: str
+    message_key: str = ""
 
     def state(self, max_body_chars: int | None = None) -> str:
         body = self.body if max_body_chars is None else self.body[:max_body_chars]
         return f"{self.headers}\n\n{body}"
+
+
+def message_key(raw_headers: bytes) -> str:
+    """Identity of a message across folders and UID changes: the normalised
+    Message-ID, else a hash of Date, From and Subject."""
+    msg = email.message_from_bytes(raw_headers)
+    message_id = _one_line(msg.get("Message-ID")).strip("<>").strip().lower()
+    if message_id:
+        return message_id
+    block = "\n".join(f"{name}: {_one_line(msg.get(name))}" for name in ("Date", "From", "Subject"))
+    return "sha256:" + hashlib.sha256(block.encode("utf-8", errors="replace")).hexdigest()
 
 
 def parse_email(uid: int, raw: bytes) -> Email:

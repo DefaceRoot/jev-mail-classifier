@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from jev_mail.config import AppConfig, Category, JevSettings, MailboxConfig
 
+DEFAULT_STATE_PATH = "/state/jev-mail.sqlite"
 PROTON_FOLDERS = {"archive": "Archive", "quarantine": "Folders/JEV Quarantine"}
 GMAIL_FOLDERS = {"archive": "[Gmail]/All Mail", "quarantine": "JEV/QUARANTINE"}
 
@@ -16,14 +17,19 @@ CATEGORIES = [
 ]
 
 
-def make_config(gmail: bool = False, **mailbox_overrides) -> AppConfig:
+def make_config(gmail: bool = False, state_path: str | None = None, **mailbox_overrides) -> AppConfig:
     mailbox = MailboxConfig(
         host="imap.example.com",
         label_folder="JEV/{label}" if gmail else "Labels/JEV-{label}",
         folders=dict(GMAIL_FOLDERS if gmail else PROTON_FOLDERS),
         **mailbox_overrides,
     )
-    return AppConfig(mailbox=mailbox, jev=JevSettings(default_threshold=0.7), categories=list(CATEGORIES))
+    return AppConfig(
+        mailbox=mailbox,
+        jev=JevSettings(default_threshold=0.7),
+        categories=list(CATEGORIES),
+        state_path=state_path or DEFAULT_STATE_PATH,
+    )
 
 
 def probs(**overrides: float) -> dict[str, float]:

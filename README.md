@@ -5,8 +5,10 @@ email gets one Jev call with one yes/no question per category, and Jev returns a
 calibrated probability for each. Categories that clear their threshold become visible
 labels, and at most one of them may move the email.
 
-Nothing is stored outside the mailbox. Handled mail carries the IMAP keyword
-`$JevProcessed`, and fetching never sets `\Seen`.
+What was sorted is recorded in a local SQLite file (`state_path`), keyed on each
+message's `Message-ID` (or a hash of Date, From and Subject when it has none). The mailbox
+is never marked, and fetching never sets `\Seen`. Because the key is the message and not
+its folder and UID, mail you drag back into a watched folder is not sorted again.
 
 ## What Jev sees
 
@@ -25,19 +27,24 @@ cp config.example.yaml config.yaml   # edit categories, folders, host
 cp .env.example .env                 # one Jev API key + IMAP_USERNAME / IMAP_PASSWORD
 pip install .
 
-jev-mail check                       # connection, folders, keyword persistence
+jev-mail check                       # connection, folders, state file; writes nothing to the mailbox
 jev-mail run --dry-run --limit 10    # print decisions for a sample, touch nothing
 jev-mail run                         # label and sort everything unprocessed, then exit
 jev-mail watch                       # drain, then IMAP IDLE for new mail
 ```
 
-Docker (config and `.env` live in the mounted `/data`; `watch` is the default command):
+Docker (config and `.env` live in the mounted `/data`, the state file in `/state`; `watch`
+is the default command):
 
 ```bash
 docker build -t jev-mail .
-docker run -d --restart unless-stopped -v "$PWD/data:/data" jev-mail
-docker run --rm -v "$PWD/data:/data" jev-mail check
+docker run -d --restart unless-stopped -v "$PWD/data:/data" -v jev-mail-state:/state jev-mail
+docker run --rm -v "$PWD/data:/data" -v jev-mail-state:/state jev-mail check
 ```
+
+**`/state` must be a persistent volume.** The state file is the only record of what was
+sorted. If it is lost, the whole inbox is classified and moved again. The container runs
+as uid 1000, so a bind mount must be writable by that user.
 
 Options go before the command: `jev-mail --dir DIR --folder NAME <command>`.
 `mailbox.watch_folders` lists the folders one process covers. `--folder` is repeatable
@@ -56,7 +63,7 @@ startup, before any COPY or MOVE, and a folder another process created first is 
 | --- | --- |
 | `run` | Creates any missing label and destination folders, then for each watch folder in order processes batches of `mailbox.batch_size` until a batch comes back smaller, so it backfills whole folders. `--dry-run` creates nothing and processes exactly one batch per folder without writing (`--limit N` sets its size). |
 | `watch` | Creates missing folders, drains every watch folder in order, then waits on IDLE in the first one (up to `poll_interval_seconds`, at most 600) and repeats, so the other folders are rechecked at least that often. |
-| `check` | Logs in, prints capabilities and the unprocessed count per watch folder, and verifies that custom keywords persist by storing `$JevProbe` on the newest message of the first watch folder, reconnecting, reading it back and removing it. Exits non-zero if a watch folder or `folders.archive` is missing, or the keyword does not persist. |
+| `check` | Makes no mailbox writes. Prints capabilities and, per watch folder, the message and unprocessed counts. Exits non-zero if a watch folder or `folders.archive` is missing, or `state_path` cannot be opened for writing. |
 
 Each email logs one line to stdout: uid, subject (80 chars), labels, destination and the
 top three probabilities. Bodies are never logged.
@@ -65,9 +72,12 @@ Failures. Timeouts, connection errors, 429, 5xx, and 401/402/403/404 from Jev st
 process with a non-zero exit, so a supervisor such as Docker restarts it and the email is
 retried. Other 4xx responses, or a body still too long at 2000 characters, give that one
 email the unmatched label and mark it processed, so one bad email cannot wedge the
-watcher. Lost connections exit non-zero as well. If the server forgets `$JevProcessed`,
-`run` and `watch` stop as soon as a handled UID comes back, rather than looping and
-billing forever.
+watcher. Lost connections exit non-zero as well.
+
+Order of effects per email: COPY each label, MOVE if there is a destination, then record
+the message in the state file. A crash before the record repeats only idempotent COPYs on
+a message that is still in the folder. A moved message has already left the watched folder.
+`--dry-run` never writes the `processed` table.
 
 ## Configuration
 
@@ -76,6 +86,7 @@ is highest priority:
 
 ```yaml
 unmatched_label: REVIEW
+state_path: /state/jev-mail.sqlite   # default; one file per account, parent dir is created
 categories:
   - name: scam
     label: SCAM
@@ -105,8 +116,9 @@ MOVE, so a crash never reprocesses a moved message.
 Bridge serves IMAP only on port 143 with STARTTLS and a self-signed certificate, so use
 `security: starttls` and `tls_verify: false`. Labels are folders under `Labels/` and
 cannot be nested (`Labels/JEV/X` fails), so use `label_folder: "Labels/JEV-{label}"`. Real
-folders live under `Folders/`, and the archive folder is `Archive`. Custom keywords such
-as `$JevProcessed` persist even though `PERMANENTFLAGS` lacks `\*`. Run `check` to confirm.
+folders live under `Folders/`, and the archive folder is `Archive`. Bridge does not keep
+custom IMAP keywords (`PERMANENTFLAGS` lacks `\*`), which is why state lives in the local
+file.
 
 Run one `jev-mail` process per Bridge account and list every folder in
 `watch_folders` (for example `[INBOX, "Folders/Bay Bravo"]`). Two processes creating

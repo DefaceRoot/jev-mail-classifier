@@ -66,6 +66,7 @@ class AppConfig:
     jev: JevSettings
     categories: list[Category]
     unmatched_label: str = "REVIEW"
+    state_path: str = "/state/jev-mail.sqlite"
 
     def category_threshold(self, category: Category) -> float:
         return category.threshold if category.threshold is not None else self.jev.default_threshold
@@ -172,6 +173,10 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
         default_threshold=float(jev_raw.get("default_threshold", 0.7)),
     )
 
+    state_path = raw.get("state_path", "/state/jev-mail.sqlite")
+    if not isinstance(state_path, str) or not state_path:
+        raise ConfigError("state_path must be a non-empty file path")
+
     raw_categories = raw.get("categories")
     if isinstance(raw_categories, dict):
         raise ConfigError("categories must be a list of {name, label, description, ...} entries, not a mapping")
@@ -199,4 +204,5 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
         jev=jev,
         categories=categories,
         unmatched_label=raw.get("unmatched_label", "REVIEW"),
+        state_path=state_path,
     )

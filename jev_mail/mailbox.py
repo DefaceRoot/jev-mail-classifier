@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import imaplib
 import ssl
+from dataclasses import replace
 
 from imapclient import IMAPClient
 
 from jev_mail.config import Decision, MailboxConfig
-from jev_mail.email_state import Email, parse_email
+from jev_mail.email_state import Email, message_key, parse_email
+from jev_mail.store import ProcessedStore
 
-PROCESSED_KEYWORD = "$JevProcessed"
+HEADER_CHUNK = 500
+IDENTITY_FETCH = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM SUBJECT)]"
 
 
 def _ssl_context(config: MailboxConfig) -> ssl.SSLContext:
@@ -31,12 +34,18 @@ def _connect(config: MailboxConfig) -> IMAPClient:
 
 
 class Mailbox:
-    """Thin wrapper around imapclient.IMAPClient: fetch unprocessed mail and
-    apply a Decision to it. Use as a context manager so the connection always
-    gets closed."""
+    """Thin wrapper around imapclient.IMAPClient: fetch mail the store hasn't
+    recorded and apply a Decision to it. Use as a context manager so the
+    connection always gets closed. `store` may be None only for read-only
+    folder checks."""
 
-    def __init__(self, config: MailboxConfig, server: IMAPClient | None = None):
+    def __init__(
+        self, config: MailboxConfig, store: ProcessedStore | None = None, server: IMAPClient | None = None
+    ):
         self._config = config
+        self._store = store
+        self._folder = ""
+        self._uidvalidity = 0
         # `server` is an injection point for tests; production code always
         # leaves it unset and lets __enter__ create the real connection.
         self._server = server
@@ -55,38 +64,57 @@ class Mailbox:
                 pass
 
     def select(self, folder: str) -> None:
-        self._server.select_folder(folder)
+        info = self._server.select_folder(folder)
+        self._folder = folder
+        self._uidvalidity = int(info[b"UIDVALIDITY"])
 
     def capabilities(self) -> list[str]:
         return sorted(c.decode() if isinstance(c, bytes) else c for c in self._server.capabilities())
 
-    def unprocessed_uids(self) -> list[int]:
-        return sorted(self._server.search(["UNKEYWORD", PROCESSED_KEYWORD]), reverse=True)
+    def _sync_identities(self) -> list[int]:
+        """Map every UID in the selected folder to its message key, fetching
+        headers only for UIDs not seen under this UIDVALIDITY. Returns all UIDs."""
+        uids = self._server.search(["ALL"])
+        known = self._store.mapped_uids(self._folder, self._uidvalidity)
+        missing = sorted(set(uids) - known, reverse=True)
+        for start in range(0, len(missing), HEADER_CHUNK):
+            response = self._server.fetch(missing[start : start + HEADER_CHUNK], [IDENTITY_FETCH])
+            keys = {
+                uid: message_key(next(v for k, v in data.items() if k.startswith(b"BODY[HEADER.FIELDS")))
+                for uid, data in response.items()
+            }
+            self._store.map_uids(self._folder, self._uidvalidity, keys)
+        return uids
+
+    def counts(self) -> tuple[int, int]:
+        """(messages in the selected folder, messages the store hasn't recorded)."""
+        uids = self._sync_identities()
+        return len(uids), len(self._store.unprocessed_uids(self._folder, self._uidvalidity, uids))
 
     def fetch_unprocessed(self, limit: int | None = None) -> list[Email]:
-        """Newest unprocessed mail first (UIDs grow with arrival). Uses
+        """Newest unrecorded mail first (UIDs grow with arrival). Uses
         BODY.PEEK so fetching never sets \\Seen, and a partial fetch so one
         huge message can't blow the bandwidth budget."""
-        uids = self.unprocessed_uids()
+        uids = self._store.unprocessed_uids(self._folder, self._uidvalidity, self._sync_identities())
         if limit is not None:
             uids = uids[:limit]
         if not uids:
             return []
+        keys = self._store.keys(self._folder, self._uidvalidity, uids)
         response = self._server.fetch(uids, [f"BODY.PEEK[]<0.{self._config.max_fetch_bytes}>"])
         emails = []
         for uid in sorted(response, reverse=True):
             # imapclient keys a partial fetch as BODY[]<origin>, not BODY.PEEK[]
             raw = next(v for k, v in response[uid].items() if k.startswith(b"BODY[]"))
-            emails.append(parse_email(uid, raw))
+            emails.append(replace(parse_email(uid, raw), message_key=keys[uid]))
         return emails
 
     def apply(self, uid: int, decision: Decision) -> None:
-        """Order matters. Label COPYs are idempotent, so a crash before the
-        marker only repeats them. The marker is set before the MOVE so a crash
-        in between never leaves a moved message looking unprocessed."""
+        """The caller records the message in the store afterwards. A crash
+        before that only repeats idempotent COPYs on a message still in the
+        folder, and a moved message has already left the watched folder."""
         for label in decision.labels:
             self._server.copy([uid], label)
-        self._server.add_flags([uid], [PROCESSED_KEYWORD])
         if decision.destination:
             self._server.move([uid], decision.destination)
 
@@ -110,20 +138,6 @@ class Mailbox:
 
     def folder_exists(self, name: str) -> bool:
         return name in self._folders()
-
-    def newest_uid(self) -> int | None:
-        uids = self._server.search(["ALL"])
-        return max(uids) if uids else None
-
-    def keywords(self, uid: int) -> set[str]:
-        flags = self._server.get_flags([uid]).get(uid, ())
-        return {f.decode() if isinstance(f, bytes) else f for f in flags}
-
-    def add_keyword(self, uid: int, keyword: str) -> None:
-        self._server.add_flags([uid], [keyword])
-
-    def remove_keyword(self, uid: int, keyword: str) -> None:
-        self._server.remove_flags([uid], [keyword])
 
     def _folders(self) -> set[str]:
         if self._folder_names is None:

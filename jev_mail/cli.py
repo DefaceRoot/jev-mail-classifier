@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import imaplib
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -9,16 +10,12 @@ from pathlib import Path
 from jev_mail.classify import classify, decide
 from jev_mail.config import AppConfig, ConfigError, Decision, load_config
 from jev_mail.email_state import MIN_BODY_CHARS, Email
-from jev_mail.mailbox import PROCESSED_KEYWORD, Mailbox
+from jev_mail.mailbox import Mailbox
 from jev_mail.providers import EmailRejected, InputTooLong, ProviderError, get_jev_client
 from jev_mail.providers.base import JevClient
+from jev_mail.store import ProcessedStore
 
 
-class MarkerNotSticking(Exception):
-    """The same (folder, UID) came back as unprocessed after being handled."""
-
-
-PROBE_KEYWORD = "$JevProbe"
 MAX_IDLE_SECONDS = 600
 
 
@@ -64,50 +61,49 @@ def _log_line(mail: Email, decision: Decision, dry_run: bool) -> str:
 
 
 def _process_batch(
-    mailbox: Mailbox,
-    client: JevClient,
-    config: AppConfig,
-    folder: str,
-    limit: int,
-    dry_run: bool,
-    done: set[tuple[str, int]],
+    mailbox: Mailbox, store: ProcessedStore, client: JevClient, config: AppConfig, limit: int, dry_run: bool
 ) -> int:
     emails = mailbox.fetch_unprocessed(limit=limit)
-    repeated = sorted(uid for uid in (mail.uid for mail in emails) if (folder, uid) in done)
-    if repeated and not dry_run:
-        raise MarkerNotSticking(
-            f"{folder!r} uids {repeated} are still unprocessed after being handled; the server isn't keeping "
-            f"{PROCESSED_KEYWORD} (run `jev-mail check`)"
-        )
     for mail in emails:
         decision = _decide_for(client, config, mail)
         if not dry_run:
             mailbox.apply(mail.uid, decision)
+            store.record(mail.message_key, decision)
         print(_log_line(mail, decision, dry_run), flush=True)
-        done.add((folder, mail.uid))
     return len(emails)
 
 
 def _drain(
     mailbox: Mailbox,
+    store: ProcessedStore,
     client: JevClient,
     config: AppConfig,
     dry_run: bool,
-    done: set[tuple[str, int]],
     limit: int | None = None,
 ) -> None:
     """Each watch folder in order: process batches until a short one. A dry run
-    sets no markers, so it would see the same mail forever: it handles exactly
-    one batch per folder. `done` holds (folder, uid) pairs already handled;
-    seeing one again means the server dropped our keyword, and continuing would
-    reclassify (and re-bill) the same mail forever."""
+    records nothing, so it would see the same mail forever: it handles exactly
+    one batch per folder."""
     batch_size = limit or config.mailbox.batch_size
     for folder in config.mailbox.watch_folders:
         mailbox.select(folder)
         while True:
-            count = _process_batch(mailbox, client, config, folder, batch_size, dry_run, done)
+            count = _process_batch(mailbox, store, client, config, batch_size, dry_run)
             if dry_run or count < batch_size:
                 break
+
+
+def _open_store(config: AppConfig) -> ProcessedStore:
+    Path(config.state_path).parent.mkdir(parents=True, exist_ok=True)
+    return ProcessedStore(config.state_path)
+
+
+def _open_store_or_report(config: AppConfig) -> ProcessedStore | None:
+    try:
+        return _open_store(config)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"error: can't open state_path {config.state_path!r}: {exc}", file=sys.stderr)
+        return None
 
 
 def _mailbox_error_message(exc: Exception, config: AppConfig) -> str:
@@ -130,16 +126,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     if started is None:
         return 1
     config, client = started
+    store = _open_store_or_report(config)
+    if store is None:
+        return 1
 
     try:
-        with Mailbox(config.mailbox) as mailbox:
+        with store, Mailbox(config.mailbox, store) as mailbox:
             if not args.dry_run:
                 mailbox.ensure_folders(config.writable_folders())
-            _drain(mailbox, client, config, args.dry_run, set(), args.limit)
+            _drain(mailbox, store, client, config, args.dry_run, args.limit)
     except (OSError, imaplib.IMAP4.error) as exc:
         print(f"error: {_mailbox_error_message(exc, config)}", file=sys.stderr)
         return 1
-    except (ProviderError, MarkerNotSticking) as exc:
+    except (ProviderError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
@@ -150,16 +149,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
     if started is None:
         return 1
     config, client = started
+    store = _open_store_or_report(config)
+    if store is None:
+        return 1
 
     folders = config.mailbox.watch_folders
     print(f"watching {folders} on {config.mailbox.host} (ctrl-c to stop)...", flush=True)
-    done: set[tuple[str, int]] = set()
     try:
-        with Mailbox(config.mailbox) as mailbox:
+        with store, Mailbox(config.mailbox, store) as mailbox:
             if not args.dry_run:
                 mailbox.ensure_folders(config.writable_folders())
             while True:
-                _drain(mailbox, client, config, args.dry_run, done)
+                _drain(mailbox, store, client, config, args.dry_run)
                 mailbox.select(folders[0])
                 if mailbox.supports_idle():
                     mailbox.idle()
@@ -170,15 +171,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
     except (OSError, imaplib.IMAP4.error) as exc:
         print(f"error: {_mailbox_error_message(exc, config)}", file=sys.stderr)
         return 1
-    except (ProviderError, MarkerNotSticking) as exc:
+    except (ProviderError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    """Read-only apart from a $JevProbe keyword on the newest message, which is
-    removed again. Proves the server keeps custom keywords across sessions,
-    because $JevProcessed is the only state this tool has."""
+    """Makes no mailbox writes. Verifies the watch and archive folders exist and
+    that the state store can be opened for writing, and reports per-folder counts."""
     try:
         config = _load(args)
     except ConfigError as exc:
@@ -186,48 +186,37 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
     problems: list[str] = []
-    folders = config.mailbox.watch_folders
-    probe_uid: int | None = None
+    store: ProcessedStore | None = None
     try:
-        with Mailbox(config.mailbox) as mailbox:
+        store = _open_store(config)
+    except (OSError, sqlite3.Error) as exc:
+        problems.append(f"state_path {config.state_path!r} is not writable: {exc}")
+
+    try:
+        with Mailbox(config.mailbox, store) as mailbox:
             print(f"connected to {config.mailbox.host}:{config.mailbox.port}")
             print(f"capabilities: {' '.join(mailbox.capabilities())}")
-            for folder in folders:
+            for folder in config.mailbox.watch_folders:
                 if not mailbox.folder_exists(folder):
                     problems.append(f"watch folder {folder!r} does not exist on the server")
-                    continue
-                mailbox.select(folder)
-                print(f"{folder!r}: {len(mailbox.unprocessed_uids())} unprocessed messages")
+                elif store is not None:
+                    mailbox.select(folder)
+                    total, unprocessed = mailbox.counts()
+                    print(f"{folder!r}: {total} messages, {unprocessed} unprocessed")
             archive = config.mailbox.folders.get("archive")
             if archive is not None and not mailbox.folder_exists(archive):
                 problems.append(f"folders.archive {archive!r} does not exist on the server")
-            if mailbox.folder_exists(folders[0]):
-                mailbox.select(folders[0])
-                probe_uid = mailbox.newest_uid()
-                if probe_uid is None:
-                    problems.append(f"{folders[0]!r} is empty, so keyword persistence can't be checked")
-                else:
-                    mailbox.add_keyword(probe_uid, PROBE_KEYWORD)
-
-        if probe_uid is not None:
-            with Mailbox(config.mailbox) as mailbox:
-                mailbox.select(folders[0])
-                try:
-                    if PROBE_KEYWORD not in mailbox.keywords(probe_uid):
-                        problems.append(
-                            f"{PROBE_KEYWORD} did not persist across sessions; {PROCESSED_KEYWORD} would not "
-                            "stick and every email would be reclassified"
-                        )
-                finally:
-                    mailbox.remove_keyword(probe_uid, PROBE_KEYWORD)
     except (OSError, imaplib.IMAP4.error) as exc:
         print(f"error: {_mailbox_error_message(exc, config)}", file=sys.stderr)
         return 1
+    finally:
+        if store is not None:
+            store.close()
 
     for problem in problems:
         print(f"FAIL: {problem}", file=sys.stderr)
     if not problems:
-        print(f"ok: {PROBE_KEYWORD} persisted across sessions and was removed")
+        print(f"ok: folders exist and {config.state_path!r} is writable")
     return 1 if problems else 0
 
 
@@ -249,7 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch_parser = subparsers.add_parser("watch", help="drain the backlog, then keep classifying new mail (IMAP IDLE)")
     watch_parser.add_argument("--dry-run", action="store_true", help="classify and print, without touching the mailbox")
 
-    subparsers.add_parser("check", help="verify the connection, folders and keyword persistence")
+    subparsers.add_parser("check", help="verify the connection, folders and state store without writing to the mailbox")
 
     return parser
 

@@ -4,11 +4,9 @@ from unittest.mock import MagicMock, call
 import pytest
 
 from jev_mail.config import Decision, MailboxConfig
-from jev_mail.mailbox import PROCESSED_KEYWORD, Mailbox
-
-
-def _raw_message(subject: str, body: str) -> bytes:
-    return f"From: a@example.com\r\nSubject: {subject}\r\n\r\n{body}\r\n".encode()
+from jev_mail.mailbox import Mailbox
+from jev_mail.store import ProcessedStore
+from tests.fake_imap import FakeImapServer, raw_message
 
 
 def _server(folders=("INBOX",)) -> MagicMock:
@@ -17,48 +15,63 @@ def _server(folders=("INBOX",)) -> MagicMock:
     return server
 
 
-def _mailbox(server, **overrides) -> Mailbox:
-    return Mailbox(MailboxConfig(host="imap.example.com", **overrides), server=server)
+def _mailbox(server, store=None, **overrides) -> Mailbox:
+    return Mailbox(MailboxConfig(host="imap.example.com", **overrides), store, server=server)
 
 
-def test_fetch_uses_peek_with_partial_cap_and_reads_the_partial_body_key():
-    server = MagicMock()
-    server.search.return_value = [1, 2, 3]
-    server.fetch.return_value = {
-        3: {b"SEQ": 3, b"BODY[]<0>": _raw_message("Newest", "world")},
-        2: {b"SEQ": 2, b"BODY[]<0>": _raw_message("Older", "hello")},
-    }
+@pytest.fixture
+def store(tmp_path):
+    with ProcessedStore(tmp_path / "s.sqlite") as store:
+        yield store
 
-    with _mailbox(server, max_fetch_bytes=1000) as mailbox:
+
+def test_fetch_uses_peek_with_partial_cap_newest_first_and_carries_message_keys(store):
+    server = FakeImapServer()
+    server.add_message("INBOX", raw_message("Oldest", "<1@x.test>"))
+    server.add_message("INBOX", raw_message("Older", "<2@x.test>", body="hello " * 10))
+    server.add_message("INBOX", raw_message("Newest", "<3@x.test>"))
+
+    with _mailbox(server, store, max_fetch_bytes=1000) as mailbox:
+        mailbox.select("INBOX")
         emails = mailbox.fetch_unprocessed(limit=2)
 
-    server.search.assert_called_once_with(["UNKEYWORD", PROCESSED_KEYWORD])
-    server.fetch.assert_called_once_with([3, 2], ["BODY.PEEK[]<0.1000>"])
-    assert [(e.uid, e.subject, e.body) for e in emails] == [(3, "Newest", "world"), (2, "Older", "hello")]
+    assert [(e.uid, e.subject, e.message_key) for e in emails] == [(3, "Newest", "3@x.test"), (2, "Older", "2@x.test")]
+    assert server.fetches[-1] == ("INBOX", [3, 2], "BODY.PEEK[]<0.1000>")
 
 
-def test_fetch_sorts_newest_first_before_limit():
-    server = MagicMock()
-    server.search.return_value = [1, 5, 3, 2, 4]
-    server.fetch.return_value = {}
+def test_fetch_skips_recorded_messages_and_fetches_no_bodies_when_nothing_is_left(store):
+    server = FakeImapServer()
+    server.add_message("INBOX", raw_message("Done", "<1@x.test>"))
 
-    with _mailbox(server) as mailbox:
-        mailbox.fetch_unprocessed(limit=2)
+    with _mailbox(server, store) as mailbox:
+        mailbox.select("INBOX")
+        (mail,) = mailbox.fetch_unprocessed()
+        store.record(mail.message_key, Decision(labels=(), destination=None))
+        server.fetches.clear()
 
-    assert server.fetch.call_args.args[0] == [5, 4]
-
-
-def test_fetch_returns_empty_without_fetching_when_nothing_unprocessed():
-    server = MagicMock()
-    server.search.return_value = []
-
-    with _mailbox(server) as mailbox:
         assert mailbox.fetch_unprocessed() == []
 
-    server.fetch.assert_not_called()
+    assert server.fetches == []
 
 
-def test_apply_copies_labels_then_marks_processed_then_moves_and_never_creates():
+def test_identity_headers_are_fetched_in_chunks_of_500_and_only_for_new_uids(store):
+    server = FakeImapServer()
+    for n in range(1200):
+        server.add_message("INBOX", raw_message(f"m{n}", f"<{n}@x.test>"))
+
+    with _mailbox(server, store) as mailbox:
+        mailbox.select("INBOX")
+        assert mailbox.counts() == (1200, 1200)
+        first = [len(uids) for _, uids, item in server.fetches if item.startswith("BODY.PEEK[HEADER")]
+        server.add_message("INBOX", raw_message("new", "<new@x.test>"))
+        server.fetches.clear()
+        assert mailbox.counts() == (1201, 1201)
+
+    assert first == [500, 500, 200]
+    assert [(uids, item[:23]) for _, uids, item in server.fetches] == [([1201], "BODY.PEEK[HEADER.FIELDS")]
+
+
+def test_apply_copies_each_label_then_moves_and_never_creates_or_flags():
     server = _server()
     decision = Decision(labels=("Labels/JEV-SCAM", "Labels/JEV-SECURITY"), destination="Folders/JEV Quarantine")
 
@@ -68,7 +81,6 @@ def test_apply_copies_labels_then_marks_processed_then_moves_and_never_creates()
     assert server.mock_calls == [
         call.copy([42], "Labels/JEV-SCAM"),
         call.copy([42], "Labels/JEV-SECURITY"),
-        call.add_flags([42], [PROCESSED_KEYWORD]),
         call.move([42], "Folders/JEV Quarantine"),
         call.logout(),
     ]
@@ -81,7 +93,7 @@ def test_apply_without_destination_never_moves():
         mailbox.apply(7, Decision(labels=("Labels/JEV-REVIEW",), destination=None))
 
     server.move.assert_not_called()
-    assert server.add_flags.call_args == call([7], [PROCESSED_KEYWORD])
+    server.copy.assert_called_once_with([7], "Labels/JEV-REVIEW")
 
 
 def test_apply_lets_a_missing_target_folder_error_propagate():
@@ -91,7 +103,6 @@ def test_apply_lets_a_missing_target_folder_error_propagate():
     with _mailbox(server) as mailbox, pytest.raises(imaplib.IMAP4.error):
         mailbox.apply(7, Decision(labels=("Labels/JEV-REVIEW",), destination="Archive"))
 
-    server.add_flags.assert_not_called()
     server.move.assert_not_called()
 
 
