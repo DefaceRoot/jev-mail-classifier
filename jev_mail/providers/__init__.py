@@ -29,7 +29,7 @@ def get_jev_client(settings: JevSettings, env: dict | None = None) -> JevClient:
                 return client_cls(api_key)
         raise ProviderError(
             "no Jev API key found -- set one of TYPESAFE_API_KEY, OPENROUTER_API_KEY, "
-            "or AI_GATEWAY_API_KEY (run `jev-mail configure` to set one)"
+            "or AI_GATEWAY_API_KEY"
         )
 
     for name, env_var, client_cls in _BACKENDS:

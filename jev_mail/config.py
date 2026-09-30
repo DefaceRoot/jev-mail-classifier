@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -10,35 +10,9 @@ from dotenv import load_dotenv
 
 _VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-ACTION_TYPES = ("tag", "move", "flag", "unflag", "mark_read", "mark_unread", "webhook")
-
 
 class ConfigError(Exception):
     """Raised for a malformed or incomplete config.yaml."""
-
-
-@dataclass
-class Action:
-    type: str
-    value: str | None = None
-    folder: str | None = None
-    url: str | None = None
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "Action":
-        if data.get("type") not in ACTION_TYPES:
-            raise ConfigError(f"unknown action type: {data.get('type')!r}")
-        return cls(type=data["type"], value=data.get("value"), folder=data.get("folder"), url=data.get("url"))
-
-    def to_dict(self) -> dict:
-        out: dict = {"type": self.type}
-        if self.value is not None:
-            out["value"] = self.value
-        if self.folder is not None:
-            out["folder"] = self.folder
-        if self.url is not None:
-            out["url"] = self.url
-        return out
 
 
 @dataclass
@@ -46,7 +20,6 @@ class Category:
     name: str
     description: str
     threshold: float | None = None
-    actions: list[Action] = field(default_factory=list)
 
 
 @dataclass
@@ -91,7 +64,7 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
     load_dotenv(env_path or config_path.parent / ".env", override=False)
 
     if not config_path.exists():
-        raise ConfigError(f"no config file at {config_path} — run `jev-mail configure` first")
+        raise ConfigError(f"no config file at {config_path}")
 
     raw = yaml.safe_load(config_path.read_text()) or {}
     env = dict(os.environ)
@@ -107,7 +80,7 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
         max_emails_per_run=int(mb_raw.get("max_emails_per_run", 25)),
     )
     if not mailbox.host:
-        raise ConfigError("mailbox.host is empty — run `jev-mail configure` and fill in the IMAP host")
+        raise ConfigError("mailbox.host is empty")
 
     jev_raw = raw.get("jev", {})
     jev = JevSettings(
@@ -116,74 +89,10 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
     )
 
     categories = [
-        Category(
-            name=name,
-            description=cat_raw.get("description", ""),
-            threshold=cat_raw.get("threshold"),
-            actions=[Action.from_dict(a) for a in cat_raw.get("actions", [])],
-        )
+        Category(name=name, description=cat_raw.get("description", ""), threshold=cat_raw.get("threshold"))
         for name, cat_raw in (raw.get("categories") or {}).items()
     ]
     if not categories:
-        raise ConfigError("config has no categories — run `jev-mail configure` to add some")
+        raise ConfigError("config has no categories")
 
     return AppConfig(mailbox=mailbox, jev=jev, categories=categories)
-
-
-def save_config(config: AppConfig, config_path: str | Path) -> None:
-    """Writes config.yaml. Mailbox credentials are always written as ${VAR}
-    references, never as literal secrets, regardless of what's loaded in memory."""
-    raw = {
-        "mailbox": {
-            "host": config.mailbox.host,
-            "port": config.mailbox.port,
-            "username": "${IMAP_USERNAME}",
-            "password": "${IMAP_PASSWORD}",
-            "folder": config.mailbox.folder,
-            "poll_interval_seconds": config.mailbox.poll_interval_seconds,
-            "max_emails_per_run": config.mailbox.max_emails_per_run,
-        },
-        "jev": {
-            "provider": config.jev.provider,
-            "default_threshold": config.jev.default_threshold,
-        },
-        "categories": {
-            cat.name: {
-                "description": cat.description,
-                **({"threshold": cat.threshold} if cat.threshold is not None else {}),
-                "actions": [a.to_dict() for a in cat.actions],
-            }
-            for cat in config.categories
-        },
-    }
-    Path(config_path).write_text(yaml.safe_dump(raw, sort_keys=False, default_flow_style=False))
-
-
-def read_env(env_path: str | Path) -> dict[str, str]:
-    """Parses a .env file into a plain dict, or {} if it doesn't exist yet."""
-    env_path = Path(env_path)
-    values: dict[str, str] = {}
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            values[key.strip()] = val.strip()
-    return values
-
-
-def save_env(values: dict[str, str], env_path: str | Path) -> None:
-    """Merges `values` into the .env file at `env_path`: a non-empty value
-    sets that key, an empty value removes it. Keys not present in `values`
-    at all are left untouched. (The credentials screen pre-fills every field
-    from the existing .env, so an empty field here means the user actually
-    cleared it -- not "didn't get around to typing anything.")"""
-    env_path = Path(env_path)
-    existing = read_env(env_path)
-    for key, value in values.items():
-        if value:
-            existing[key] = value
-        else:
-            existing.pop(key, None)
-    env_path.write_text("".join(f"{k}={v}\n" for k, v in existing.items()))

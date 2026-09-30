@@ -25,7 +25,7 @@ class Email:
 
 class Mailbox:
     """Thin wrapper around imapclient.IMAPClient: fetch unprocessed mail and
-    apply the primitive actions (tag/move/flag/seen). Use as a context
+    apply the primitive actions. Use as a context
     manager so the connection always gets closed."""
 
     def __init__(self, config: MailboxConfig, server: IMAPClient | None = None):
@@ -73,19 +73,10 @@ class Mailbox:
     def mark_processed(self, uid: int) -> None:
         self._server.add_flags([uid], [PROCESSED_KEYWORD])
 
-    def add_tag(self, uid: int, value: str) -> None:
-        self._server.add_flags([uid], [value])
-
     def move(self, uid: int, folder: str) -> None:
         if folder not in (name for _, _, name in self._server.list_folders()):
             self._server.create_folder(folder)
         self._server.move([uid], folder)
-
-    def set_flag(self, uid: int, flagged: bool) -> None:
-        (self._server.add_flags if flagged else self._server.remove_flags)([uid], [b"\\Flagged"])
-
-    def set_seen(self, uid: int, seen: bool) -> None:
-        (self._server.add_flags if seen else self._server.remove_flags)([uid], [b"\\Seen"])
 
     def supports_idle(self) -> bool:
         return bool(self._server.has_capability("IDLE"))

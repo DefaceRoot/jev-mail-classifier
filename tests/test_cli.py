@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock
 
 import jev_mail.cli as cli
-from jev_mail.config import Action, AppConfig, Category, JevSettings, MailboxConfig
+from jev_mail.config import AppConfig, Category, JevSettings, MailboxConfig
 from jev_mail.mailbox import Email
 
 
@@ -9,7 +9,7 @@ def _config() -> AppConfig:
     return AppConfig(
         mailbox=MailboxConfig(host="imap.example.com"),
         jev=JevSettings(default_threshold=0.6),
-        categories=[Category(name="invoice", description="Invoice", actions=[Action(type="tag", value="Invoice")])],
+        categories=[Category(name="invoice", description="Invoice")],
     )
 
 
@@ -24,8 +24,6 @@ def test_build_parser_defaults_and_dry_run_flag():
     assert args.command == "watch"
     assert args.dry_run is False
 
-    args = parser.parse_args(["configure"])
-    assert args.command == "configure"
 
 
 def test_process_unprocessed_passes_limit_to_fetch():
@@ -61,12 +59,11 @@ def test_process_unprocessed_dry_run_does_not_mutate_mailbox(capsys):
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=True)
 
-    mailbox.add_tag.assert_not_called()
     mailbox.mark_processed.assert_not_called()
     assert "dry-run" in capsys.readouterr().out
 
 
-def test_process_unprocessed_applies_actions_and_marks_processed():
+def test_process_unprocessed_marks_processed():
     mailbox = MagicMock()
     mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Invoice #1", body="Please pay")]
     client = MagicMock()
@@ -74,7 +71,6 @@ def test_process_unprocessed_applies_actions_and_marks_processed():
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=False)
 
-    mailbox.add_tag.assert_called_once_with(1, "Invoice")
     mailbox.mark_processed.assert_called_once_with(1)
 
 
@@ -86,7 +82,6 @@ def test_process_unprocessed_below_threshold_no_actions():
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=False)
 
-    mailbox.add_tag.assert_not_called()
     mailbox.mark_processed.assert_called_once_with(1)
 
 
@@ -130,26 +125,3 @@ def test_cmd_run_reports_connection_error_not_a_traceback(monkeypatch, capsys):
     assert exit_code == 1
     assert "Traceback" not in err
     assert "imap.example.com" in err
-
-
-def test_main_auto_launches_configure_when_no_config(monkeypatch, tmp_path):
-    called = {}
-    monkeypatch.setattr(cli, "cmd_configure", lambda args: called.setdefault("cmd", "configure") or 0)
-    monkeypatch.setattr(cli.sys, "argv", ["jev-mail", "--dir", str(tmp_path)])
-    monkeypatch.setattr(cli.sys, "exit", lambda code: called.setdefault("exit", code))
-
-    cli.main()
-
-    assert called["cmd"] == "configure"
-
-
-def test_main_auto_runs_when_config_exists(monkeypatch, tmp_path):
-    (tmp_path / "config.yaml").write_text("mailbox:\n  host: x\ncategories: {}\n")
-    called = {}
-    monkeypatch.setattr(cli, "cmd_run", lambda args: called.setdefault("cmd", "run") or 0)
-    monkeypatch.setattr(cli.sys, "argv", ["jev-mail", "--dir", str(tmp_path)])
-    monkeypatch.setattr(cli.sys, "exit", lambda code: called.setdefault("exit", code))
-
-    cli.main()
-
-    assert called["cmd"] == "run"

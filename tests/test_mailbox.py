@@ -70,13 +70,6 @@ def test_mark_processed_adds_keyword():
     fake_server.add_flags.assert_called_once_with([42], [PROCESSED_KEYWORD])
 
 
-def test_add_tag():
-    fake_server = MagicMock()
-    with Mailbox(MailboxConfig(host="imap.example.com"), server=fake_server) as mailbox:
-        mailbox.add_tag(1, "Invoice")
-    fake_server.add_flags.assert_called_once_with([1], ["Invoice"])
-
-
 def test_move_creates_folder_if_missing():
     fake_server = MagicMock()
     fake_server.list_folders.return_value = [("\\HasNoChildren", "/", "INBOX")]
@@ -97,24 +90,6 @@ def test_move_skips_create_when_folder_exists():
 
     fake_server.create_folder.assert_not_called()
     fake_server.move.assert_called_once_with([1], "Invoices")
-
-
-def test_set_flag_true_and_false():
-    fake_server = MagicMock()
-    with Mailbox(MailboxConfig(host="imap.example.com"), server=fake_server) as mailbox:
-        mailbox.set_flag(1, True)
-        mailbox.set_flag(1, False)
-    fake_server.add_flags.assert_called_once_with([1], [b"\\Flagged"])
-    fake_server.remove_flags.assert_called_once_with([1], [b"\\Flagged"])
-
-
-def test_set_seen_true_and_false():
-    fake_server = MagicMock()
-    with Mailbox(MailboxConfig(host="imap.example.com"), server=fake_server) as mailbox:
-        mailbox.set_seen(1, True)
-        mailbox.set_seen(1, False)
-    fake_server.add_flags.assert_called_once_with([1], [b"\\Seen"])
-    fake_server.remove_flags.assert_called_once_with([1], [b"\\Seen"])
 
 
 def test_context_manager_logs_out():

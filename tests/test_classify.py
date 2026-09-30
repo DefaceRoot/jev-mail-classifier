@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock
 
 from jev_mail.classify import classify, matched_categories
-from jev_mail.config import Action, AppConfig, Category, JevSettings, MailboxConfig
+from jev_mail.config import AppConfig, Category, JevSettings, MailboxConfig
 
 
 def _config(**category_overrides) -> AppConfig:
@@ -9,12 +9,11 @@ def _config(**category_overrides) -> AppConfig:
         mailbox=MailboxConfig(host="imap.example.com"),
         jev=JevSettings(default_threshold=0.6),
         categories=[
-            Category(name="invoice", description="Invoice", actions=[Action(type="tag", value="Invoice")]),
+            Category(name="invoice", description="Invoice"),
             Category(
                 name="urgent",
                 description="Urgent",
                 threshold=category_overrides.get("urgent_threshold", 0.6),
-                actions=[Action(type="flag")],
             ),
         ],
     )
