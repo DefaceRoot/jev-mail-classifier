@@ -6,7 +6,21 @@ import httpx
 
 
 class ProviderError(Exception):
-    """Raised when a Jev backend can't be reached or returns something unexpected."""
+    """Raised when a Jev backend can't be reached or returns something unexpected.
+    A plain ProviderError is never about one email: it means retry later."""
+
+
+class InputTooLong(ProviderError):
+    """The state exceeded the model's context window."""
+
+
+class EmailRejected(ProviderError):
+    """The backend refused this particular input; retrying it can't succeed."""
+
+
+# Client errors that say something is wrong with our account or endpoint, not
+# with the email, so they must stop the process instead of poisoning mail.
+_ACCOUNT_LEVEL_STATUSES = {401, 402, 403, 404, 408, 429}
 
 
 def describe_http_error(exc: httpx.HTTPError) -> str:
@@ -17,6 +31,17 @@ def describe_http_error(exc: httpx.HTTPError) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         return f"{exc.response.status_code} {exc.response.reason_phrase}"
     return str(exc)
+
+
+def to_provider_error(service: str, exc: httpx.HTTPError) -> ProviderError:
+    message = f"{service} request failed: {describe_http_error(exc)}"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 400 and "max_tokens_exceeded" in exc.response.text:
+            return InputTooLong(message)
+        if 400 <= status < 500 and status not in _ACCOUNT_LEVEL_STATUSES:
+            return EmailRejected(message)
+    return ProviderError(message)
 
 
 class JevClient(Protocol):

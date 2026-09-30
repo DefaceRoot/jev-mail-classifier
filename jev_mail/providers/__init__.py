@@ -4,7 +4,7 @@ import os
 
 from jev_mail.config import JevSettings
 
-from .base import JevClient, ProviderError
+from .base import EmailRejected, InputTooLong, JevClient, ProviderError
 from .openrouter import OpenRouterJevClient
 from .typesafe_direct import TypeSafeDirectClient
 from .vercel_gateway import VercelGatewayJevClient
@@ -16,7 +16,7 @@ _BACKENDS = (
     ("vercel", "AI_GATEWAY_API_KEY", VercelGatewayJevClient),
 )
 
-__all__ = ["JevClient", "ProviderError", "get_jev_client"]
+__all__ = ["EmailRejected", "InputTooLong", "JevClient", "ProviderError", "get_jev_client"]
 
 
 def _build(client_cls, api_key: str, settings: JevSettings) -> JevClient:
