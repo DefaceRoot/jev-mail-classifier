@@ -1,40 +1,88 @@
-# Generated automatically by `jev-mail configure`. Hand-editing is fine too --
-# this file is just for reference / a starting point if you'd rather not use
-# the TUI. Secrets never go here: they live in .env and are referenced as
-# ${VAR}.
-
-mailbox:
-  host: imap.gmail.com
-  port: 993
-  username: ${IMAP_USERNAME}
-  password: ${IMAP_PASSWORD}
-  folder: INBOX
-  poll_interval_seconds: 60 # used by `watch` only if the server has no IDLE support
-  max_emails_per_run: 25 # caps how many unprocessed emails get classified in one run/poll
+# Copy to config.yaml. Secrets never go here: they live in .env (or the
+# container environment) and are referenced as ${VAR}.
 
 jev:
-  provider: auto # auto | typesafe | openrouter | vercel
-  default_threshold: 0.6
+  provider: openrouter # auto | typesafe | openrouter | vercel
+  model: typesafe/jev-1.13 # honoured by the openrouter provider only
+  default_threshold: 0.7
 
+mailbox:
+  # Proton Bridge: STARTTLS on 143 with a self-signed certificate.
+  host: bridge
+  port: 143
+  security: starttls # starttls | ssl
+  tls_verify: false # default true; Bridge's certificate is self-signed
+  username: ${IMAP_USERNAME}
+  password: ${IMAP_PASSWORD}
+  # Folders one process covers. `watch` idles on the first and rechecks the rest every
+  # poll interval. Run ONE process per Proton account: concurrent writers deadlock Bridge.
+  watch_folders: [INBOX, "Folders/Bay Bravo"]
+  batch_size: 25
+  max_fetch_bytes: 524288 # partial fetch cap per message
+  poll_interval_seconds: 600 # IDLE re-arm / fallback poll, capped at 600
+  # Proton labels are folders under Labels/ and cannot be nested.
+  label_folder: "Labels/JEV-{label}"
+  folders: # where each moving disposition sends mail
+    archive: Archive
+    quarantine: "Folders/JEV Quarantine"
+
+  # Gmail (imap.gmail.com, app password): nested labels work, and archiving
+  # means moving out of INBOX to All Mail.
+  #   host: imap.gmail.com
+  #   port: 993
+  #   security: ssl
+  #   tls_verify: true
+  #   label_folder: "JEV/{label}"
+  #   folders:
+  #     archive: "[Gmail]/All Mail"
+  #     quarantine: "JEV/QUARANTINE"
+
+unmatched_label: REVIEW # applied when no category clears its threshold
+
+# SQLite file recording which messages were sorted, keyed on Message-ID. It is the
+# only record, so keep it on a persistent volume (Docker: mount /state). One file per
+# account; the parent directory is created if missing.
+state_path: /state/jev-mail.sqlite
+
+# Ordered by priority: the first matching category that has a disposition and
+# clears its disposition_threshold decides where the email goes. Every category
+# that clears `threshold` still adds its label. disposition_threshold is optional,
+# defaults to the category's own threshold, and may not be lower than it.
 categories:
-  invoice:
-    description: "Invoice, billing statement, or payment request"
-    actions:
-      - type: tag
-        value: Invoice
-      - type: move
-        folder: Invoices
-
-  urgent:
-    description: "Time-sensitive, needs action today"
-    threshold: 0.7 # overrides jev.default_threshold for this category
-    actions:
-      - type: flag
-      - type: webhook
-        url: ${SLACK_WEBHOOK_URL}
-
-  spam:
-    description: "Spam, phishing, or an unsolicited sales pitch"
-    actions:
-      - type: move
-        folder: Spam
+  - name: scam
+    label: SCAM
+    description: "Scam, phishing, or fraud: fake government or compliance notices (USDOT, FMCSA, MCS-150), advance-fee pitches, credential harvesting"
+    threshold: 0.8
+    disposition: quarantine
+  - name: phishing
+    label: PHISHING
+    description: "Probable phishing: lookalike sender, urgent account or payment pressure, suspicious links"
+    threshold: 0.5 # worth a label at 0.5...
+    disposition: quarantine
+    disposition_threshold: 0.8 # ...but only quarantined at 0.8
+  - name: security
+    label: SECURITY
+    description: "Security alert or verification code from a service the recipient really uses"
+    disposition: quarantine
+  - name: action
+    label: ACTION
+    description: "A customer or colleague who needs a reply or a decision soon"
+    disposition: keep # stays in the inbox and blocks lower-priority archiving
+  - name: cold_outreach
+    label: COLD
+    description: "Unsolicited sales or marketing pitch from a company the recipient has no relationship with"
+    disposition: archive
+  - name: newsletter
+    label: NEWSLETTER
+    description: "Newsletter, digest, or promotional mailing the recipient subscribed to"
+    disposition: archive
+  - name: spam
+    label: SPAM
+    description: "Obvious spam"
+    threshold: 0.7
+    disposition: archive
+    disposition_threshold: 0.9 # labelled at 0.7, archived only at very high confidence
+  - name: receipt
+    label: RECEIPT
+    description: "Receipt, invoice, or payment confirmation"
+    # no disposition: labelled but left where it is

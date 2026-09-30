@@ -1,223 +1,156 @@
-<div align="center">
+# jev-mail-classifier
 
-```
-     ██╗███████╗██╗   ██╗    ███╗   ███╗ █████╗ ██╗██╗
-     ██║██╔════╝██║   ██║    ████╗ ████║██╔══██╗██║██║
-     ██║█████╗  ██║   ██║    ██╔████╔██║███████║██║██║
-██   ██║██╔══╝  ╚██╗ ██╔╝    ██║╚██╔╝██║██╔══██║██║██║
-╚█████╔╝███████╗ ╚████╔╝     ██║ ╚═╝ ██║██║  ██║██║███████╗
- ╚════╝ ╚══════╝  ╚═══╝      ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝╚══════╝
-```
+Sorts an IMAP inbox with [Jev](https://typesafe.ai), TypeSafe's System One model. Each
+email gets one Jev call with one yes/no question per category, and Jev returns a
+calibrated probability for each. Categories that clear their threshold become visible
+labels, and at most one of them may move the email.
 
-**Your inbox, judged in milliseconds.**
+What was sorted is recorded in a local SQLite file (`state_path`), keyed on each
+message's `Message-ID` (or a hash of Date, From and Subject when it has none). The mailbox
+is never marked, and fetching never sets `\Seen`. Because the key is the message and not
+its folder and UID, mail you drag back into a watched folder is not sorted again.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Powered by Jev](https://img.shields.io/badge/powered%20by-Jev-purple)](https://typesafe.ai)
-[![TUI: Textual](https://img.shields.io/badge/TUI-Textual-orange)](https://github.com/textualize/textual)
+## What Jev sees
 
-*Tag, move, flag, and notify -- no LLM prompt engineering, no JSON parsing, no per-email API bill that adds up.*
+The headers `From`, `Reply-To`, `To`, `Cc`, `Date`, `Subject` and the first
+`Authentication-Results`, plus `List-Unsubscribe: present` when that header exists. Then
+the whole body: every non-attachment `text/plain` part, or the `text/html` parts
+converted to text when there is no plain text. Nothing else is sent.
 
-https://github.com/user-attachments/assets/4604d2ff-6e59-4938-983e-305d355be5d2
-
-</div>
-
----
-
-## Why
-
-Classifying email with a normal LLM means writing a prompt, hoping it returns valid
-JSON, and paying full chat-completion prices for what is really just "does this apply:
-yes or no." [Jev](https://typesafe.ai), TypeSafe's **System One model**, skips all of
-that: you send it your inbox state and a set of yes/no questions, and it hands back
-calibrated probabilities directly -- typically in well under a second, for a fraction of
-a cent per email.
-
-### What makes Jev different from calling an LLM
-
-Chat LLMs are trained with RLHF to produce fluent, human-pleasing *text* -- great for
-conversation, but that same optimization is what makes them mode-drop, hedge, and
-overstate confidence when what you actually need is a reliable decision buried inside
-software. Jev is TypeSafe's first **System One model**: instead of generating a
-sentence you have to parse, it's trained with **Reinforcement Learning for Calibrated
-Decisions (RLCD)** to output typed, calibrated probabilities directly -- "more like
-code: reliable, fast, self-consistent, and type-safe" than like a chatbot reply.
-
-That shows up as a very different cost and latency profile for exactly the kind of
-question `jev-mail-classifier` asks per email ("is this an invoice, yes or no"):
-
-- **~193x faster** than a general-purpose LLM on this class of task
-- **~238x cheaper** per token than Claude ($42 per billion input tokens)
-- In TypeSafe's own benchmark, an equivalent workflow ran in **0.114s for $0.000081**
-  on Jev vs. **8.566s for $0.014** on an LLM
-
-Because the output is a calibrated probability rather than free text, you also get a
-knob a chat completion doesn't give you for free: a **threshold per category**. Set
-`urgent` to fire at `0.7` and `spam` at `0.9`, and Jev's own confidence -- not a second
-prompt asking "are you sure?" -- decides whether an action runs.
-
-**jev-mail-classifier** wraps that in something you can actually run against a real
-mailbox: connect over IMAP, define categories in plain language, and let each category
-tag, move, flag, or ping a webhook -- all from a terminal UI, no code required.
+If the backend reports the input is too long for the model's context, the same email is
+retried with the body halved (headers kept) down to 2000 characters.
 
 ## Quickstart
 
 ```bash
-git clone https://github.com/parth-kp/jev-mail-classifier
-cd jev-mail-classifier
-./install.sh
+cp config.example.yaml config.yaml   # edit categories, folders, host
+cp .env.example .env                 # one Jev API key + IMAP_USERNAME / IMAP_PASSWORD
+pip install .
+
+jev-mail check                       # connection, folders, state file; writes nothing to the mailbox
+jev-mail run --dry-run --limit 10    # print decisions for a sample, touch nothing
+jev-mail run                         # label and sort everything unprocessed, then exit
+jev-mail watch                       # drain, then IMAP IDLE for new mail
 ```
 
-That's it -- `install.sh` sets up a virtualenv, installs the package, and drops you
-straight into the setup wizard. Paste **one** Jev API key (TypeSafe, OpenRouter, or
-Vercel AI Gateway -- whichever you have), your IMAP login, and start adding categories.
-
-Once configured, run it with `./jev-mail` from inside the project directory --
-`install.sh` installs into a local `.venv`, and `./jev-mail` is a small wrapper that
-finds it for you, so there's no venv to activate and nothing to add to your shell PATH:
+Docker (config and `.env` live in the mounted `/data`, the state file in `/state`; `watch`
+is the default command):
 
 ```bash
-./jev-mail run             # classify unprocessed mail once, then exit (cron-friendly)
-./jev-mail run --dry-run   # see what WOULD happen, without touching your mailbox
-./jev-mail watch           # keep classifying new mail as it arrives (IMAP IDLE)
-./jev-mail configure       # reopen the TUI to add/edit categories or credentials any time
+docker build -t jev-mail .
+docker run -d --restart unless-stopped -v "$PWD/data:/data" -v jev-mail-state:/state jev-mail
+docker run --rm -v "$PWD/data:/data" -v jev-mail-state:/state jev-mail check
 ```
 
-Re-running `./install.sh` later is safe -- it won't ask for your key/login again if
-`config.yaml` already exists, and the credentials screen always shows what's already
-saved (masked) rather than blank fields.
+**`/state` must be a persistent volume.** The state file is the only record of what was
+sorted. If it is lost, the whole inbox is classified and moved again. The container runs
+as uid 1000, so a bind mount must be writable by that user.
 
-> **Coming soon:** `pipx install jev-mail-classifier` -- for now, `install.sh` after
-> cloning is the whole setup.
+Options go before the command: `jev-mail --dir DIR --folder NAME <command>`.
+`mailbox.watch_folders` lists the folders one process covers. `--folder` is repeatable
+and replaces that list for a single invocation:
 
-## Getting your IMAP username & password
-
-The wizard asks for these on the first screen. "Username" is just your email address;
-"password" is where people get stuck, because **if your account has 2-factor
-authentication on, your normal login password will not work over IMAP** -- you need a
-separate *app password* instead.
-
-**Gmail**
-1. Turn on IMAP: Gmail Settings (gear icon) -> **See all settings** -> **Forwarding and
-   POP/IMAP** tab -> enable IMAP -> Save.
-2. Create an app password: go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
-   (requires 2-Step Verification to be on -- turn it on first if it isn't). Name it
-   anything (e.g. "jev-mail"), copy the 16-character password it gives you.
-3. Use your full Gmail address as the username, and that 16-character code as the
-   password. Host: `imap.gmail.com`, port `993`.
-
-**Outlook / Microsoft 365**
-1. Go to [account.microsoft.com/security](https://account.microsoft.com/security) ->
-   **Advanced security options** -> **App passwords** -> create one.
-2. Username is your full email address, password is the app password. Host:
-   `outlook.office365.com`, port `993`.
-
-**Yahoo Mail**
-1. Account Info -> **Account Security** -> turn on 2-step verification -> **Generate
-   app password**. Host: `imap.mail.yahoo.com`, port `993`.
-
-**Any other provider**
-Look for "IMAP settings" in your provider's account/security settings -- you need the
-IMAP host and port (almost always `993`), and, if 2FA is on, an app-specific password
-generated the same way. If 2FA is off, your regular email password usually works, but
-an app password is safer since it can be revoked without changing your main password.
-
-## What it looks like
-
-`jev-mail configure` is a three-step terminal UI:
-
-1. **Credentials** -- paste your Jev key and IMAP login (masked input, written straight
-   to a git-ignored `.env` -- you never hand-edit a config file for secrets)
-2. **Mailbox** -- host, port, folder to watch, poll interval
-3. **Categories** -- a live list you manage with single keystrokes:
-   `a` add &middot; `e` edit &middot; `d` delete &middot; `s` save & exit
-
-<p align="center">
-  <img src="media/screenshots/tui-1-credentials.png" alt="Credentials screen: paste one Jev key and your IMAP login" width="49%">
-  <img src="media/screenshots/tui-2-mailbox.png" alt="Mailbox screen: IMAP host, port, folder, poll interval" width="49%">
-</p>
-<p align="center">
-  <img src="media/screenshots/tui-3-categories.png" alt="Categories screen: live list of configured categories" width="49%">
-  <img src="media/screenshots/tui-4-category-edit.png" alt="Edit category screen: description plus a checklist of actions" width="49%">
-</p>
-
-Each category is a plain-language description plus a checklist of actions -- tag, move,
-flag, mark read, or hit a webhook -- no YAML syntax to remember.
-
-## How it works
-
-```
-   IMAP inbox                    Jev                      your mailbox
- ┌──────────────┐   subject+body   ┌───────────┐   probabilities   ┌──────────────┐
- │  unprocessed │ ───────────────► │  one call, │ ────────────────► │ tag / move / │
- │    email     │                  │ one yes/no │                    │ flag / hook  │
- │              │ ◄─────────────── │  question  │ ◄──────────────── │              │
- └──────────────┘   marked          │ per category│    threshold      └──────────────┘
-                     processed       └───────────┘     per category
+```bash
+jev-mail --folder INBOX --folder "Folders/Bay Bravo" watch
 ```
 
-Every configured category becomes one independent yes/no question in a **single** Jev
-call per email (multi-label: an email can match several categories at once). Each
-category's probability is checked against its threshold, and every action attached to a
-matching category runs. Processed mail is marked with a private IMAP keyword
-(`$JevProcessed`) -- no separate database to keep in sync.
+Run one process per account. Every label and destination folder is created once at
+startup, before any COPY or MOVE, and a folder another process created first is tolerated.
 
-## Config, if you'd rather skip the TUI
+## Commands
 
-`config.yaml` (see [`config.example.yaml`](config.example.yaml)) is plain and hand-editable:
+| Command | Behaviour |
+| --- | --- |
+| `run` | Creates any missing label and destination folders, then for each watch folder in order processes batches of `mailbox.batch_size` until a batch comes back smaller, so it backfills whole folders. `--dry-run` creates nothing and processes exactly one batch per folder without writing (`--limit N` sets its size). |
+| `watch` | Creates missing folders, drains every watch folder in order, then waits on IDLE in the first one (up to `poll_interval_seconds`, at most 600) and repeats, so the other folders are rechecked at least that often. |
+| `check` | Makes no mailbox writes. Prints capabilities and, per watch folder, the message and unprocessed counts. Exits non-zero if a watch folder or `folders.archive` is missing, or `state_path` cannot be opened for writing. |
+
+Each email logs one line to stdout: uid, subject (80 chars), labels, destination and the
+top three probabilities. Bodies are never logged.
+
+Failures. Timeouts, connection errors, 429, 5xx, and 401/402/403/404 from Jev are retried
+in-process three more times after 10, 30 and 90 seconds, then stop the
+process with a non-zero exit, so a supervisor such as Docker restarts it and the email is
+retried. Other 4xx responses, or a body still too long at 2000 characters, give that one
+email the unmatched label and mark it processed, so one bad email cannot wedge the
+watcher. Lost connections exit non-zero as well.
+
+Heartbeat. `watch` and `run` write the current UTC ISO timestamp to a `heartbeat` file
+next to `state_path`: once the IMAP connection is up (`watch`), after every email is
+processed (`--dry-run` included), before each Jev retry sleep, and after every IDLE or
+sleep cycle (`watch`). A host watchdog can restart a process whose heartbeat has gone
+stale, such as one stuck on an IMAP command that never returns.
+
+Order of effects per email: COPY each label, MOVE if there is a destination, then record
+the message in the state file. A crash before the record repeats only idempotent COPYs on
+a message that is still in the folder. A moved message has already left the watched folder.
+`--dry-run` never writes the `processed` table.
+
+## Configuration
+
+See [`config.example.yaml`](config.example.yaml). Categories are an ordered list, first
+is highest priority:
 
 ```yaml
+unmatched_label: REVIEW
+state_path: /state/jev-mail.sqlite   # default; one file per account, parent dir is created
 categories:
-  invoice:
-    description: "Invoice, billing statement, or payment request"
-    actions:
-      - type: tag
-        value: Invoice
-      - type: move
-        folder: Invoices
-
-  urgent:
-    description: "Time-sensitive, needs action today"
-    threshold: 0.7
-    actions:
-      - type: flag
-      - type: webhook
-        url: ${SLACK_WEBHOOK_URL}
+  - name: scam
+    label: SCAM
+    description: "Scam or phishing"
+    threshold: 0.8            # optional, default is jev.default_threshold
+    disposition: quarantine   # optional: keep | archive | quarantine
+    disposition_threshold: 0.9  # optional, see below
 ```
 
-`mailbox.max_emails_per_run` (default `25`) caps how many unprocessed emails get
-classified in a single `run` or poll cycle -- protects against a huge backlog burning
-through your Jev quota or a run taking forever the first time you point this at a real
-inbox. If a run hits the cap, it prints a notice and picks up the rest next time.
-"Unprocessed" means missing the `$JevProcessed` keyword, not `\Seen`/unread -- opening
-an email doesn't skip it. When capped, the newest unprocessed mail is classified first.
+**Labels.** Every category that clears its threshold adds its label, in priority order.
+If none does, the email gets the `unmatched_label`. Labels are IMAP folders named by
+`mailbox.label_folder` (for example `Labels/JEV-{label}`) and are applied with COPY, so
+the message stays where it is.
 
-| Action        | What it does                                   |
-| ------------- | ----------------------------------------------- |
-| `tag`         | Adds a custom IMAP keyword to the message        |
-| `move`        | Moves the message to another folder (creates it if missing) |
-| `flag`        | Sets the `\Flagged` (star) system flag           |
-| `unflag`      | Clears it                                        |
-| `mark_read`   | Sets `\Seen`                                     |
-| `mark_unread` | Clears it                                        |
-| `webhook`     | `POST`s `{category, probability, subject}` to a URL |
+**Dispositions.** The first matched category, in priority order, that has a disposition
+and whose probability also clears its `disposition_threshold` decides the single move.
+`disposition_threshold` defaults to the category's own threshold and may not be lower
+than it, so a category can label at 0.5 but only quarantine at 0.8. A labelled category
+below its disposition threshold has no say, so lower-priority categories can still move
+the email. `archive` and `quarantine` move to `mailbox.folders.archive` and
+`mailbox.folders.quarantine`. `keep` means no move and blocks lower-priority archive or
+quarantine. A category with no disposition has no opinion. The marker is set before the
+MOVE, so a crash never reprocesses a moved message.
 
-## Three ways to power it
+## Proton Bridge
 
-Set **one** of these in `.env` (the wizard writes it for you) -- checked in this order:
+Bridge serves IMAP only on port 143 with STARTTLS and a self-signed certificate, so use
+`security: starttls` and `tls_verify: false`. Labels are folders under `Labels/` and
+cannot be nested (`Labels/JEV/X` fails), so use `label_folder: "Labels/JEV-{label}"`. Real
+folders live under `Folders/`, and the archive folder is `Archive`. Bridge does not keep
+custom IMAP keywords (`PERMANENTFLAGS` lacks `\*`), which is why state lives in the local
+file.
 
-| Priority | Env var               | Backend                                   |
-| -------- | ---------------------- | ------------------------------------------ |
-| 1        | `TYPESAFE_API_KEY`     | TypeSafe's own API, direct                  |
-| 2        | `OPENROUTER_API_KEY`   | Via OpenRouter's Decisions endpoint         |
-| 3        | `AI_GATEWAY_API_KEY`   | Via Vercel AI Gateway                       |
+Run one `jev-mail` process per Bridge account and list every folder in
+`watch_folders` (for example `[INBOX, "Folders/Bay Bravo"]`). Two processes creating
+labels and copying at once deadlocked Bridge, hanging every write until it was restarted.
 
-Or set `jev.provider` in `config.yaml` to pin one explicitly instead of auto-detecting.
+## Gmail
 
-> The OpenRouter path is live-verified. The TypeSafe-direct and Vercel-gateway adapters
-> are built from their published docs but not yet tested against a live key -- if one of
-> those breaks for you, `jev_mail/providers/` is the one place to look, and pull
-> requests are very welcome.
+Use an [app password](https://myaccount.google.com/apppasswords) (2-Step Verification
+required) with IMAP enabled, `host: imap.gmail.com`, `port: 993`, `security: ssl`.
+Labels are nested folders (`label_folder: "JEV/{label}"`). Archiving is a MOVE out of
+INBOX to `[Gmail]/All Mail`. COPY into a label folder adds the label and keeps the
+message in INBOX.
+
+## Jev providers
+
+Set one key in `.env`, checked in this order, or pin `jev.provider`:
+
+| Env var | Backend |
+| --- | --- |
+| `TYPESAFE_API_KEY` | TypeSafe API, direct |
+| `OPENROUTER_API_KEY` | OpenRouter Decisions endpoint (live-verified; honours `jev.model`) |
+| `AI_GATEWAY_API_KEY` | Vercel AI Gateway |
+
+The TypeSafe-direct and Vercel adapters are built from published docs and are untested
+against a live key. `jev_mail/providers/` is the place to look if one breaks.
 
 ## Development
 
@@ -228,4 +161,4 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

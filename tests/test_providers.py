@@ -3,7 +3,7 @@ import pytest
 
 from jev_mail.config import JevSettings
 from jev_mail.providers import ProviderError, get_jev_client
-from jev_mail.providers.base import describe_http_error
+from jev_mail.providers.base import EmailRejected, InputTooLong, describe_http_error
 from jev_mail.providers.openrouter import OpenRouterJevClient
 from jev_mail.providers.typesafe_direct import TypeSafeDirectClient
 from jev_mail.providers.vercel_gateway import VercelGatewayJevClient
@@ -118,3 +118,42 @@ def test_get_jev_client_explicit_provider_missing_key_raises():
 def test_get_jev_client_explicit_provider_unknown_raises():
     with pytest.raises(ProviderError):
         get_jev_client(JevSettings(provider="not-a-real-provider"), env={"TYPESAFE_API_KEY": "x"})
+
+
+def test_get_jev_client_passes_configured_model_to_openrouter():
+    client = get_jev_client(
+        JevSettings(provider="openrouter", model="typesafe/jev-9.9"), env={"OPENROUTER_API_KEY": "or-key"}
+    )
+    assert client._model == "typesafe/jev-9.9"
+
+
+def _status_failure(monkeypatch, status, body):
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _fake_response(body, status_code=status))
+
+
+def test_context_overflow_400_raises_input_too_long(monkeypatch):
+    _status_failure(
+        monkeypatch,
+        400,
+        {"error": {"message": 'HTTP 400: {"detail":{"error_type":"max_tokens_exceeded"}}', "code": 400}},
+    )
+
+    with pytest.raises(InputTooLong):
+        OpenRouterJevClient(api_key="k").decide("body", CATEGORIES)
+
+
+def test_other_400_is_rejected_for_this_email_only(monkeypatch):
+    _status_failure(monkeypatch, 422, {"error": {"message": "bad input"}})
+
+    with pytest.raises(EmailRejected):
+        OpenRouterJevClient(api_key="k").decide("body", CATEGORIES)
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 404, 429, 500, 503])
+def test_account_level_and_server_failures_are_not_per_email(monkeypatch, status):
+    _status_failure(monkeypatch, status, {"error": {"message": "nope"}})
+
+    with pytest.raises(ProviderError) as exc_info:
+        OpenRouterJevClient(api_key="k").decide("body", CATEGORIES)
+
+    assert not isinstance(exc_info.value, (InputTooLong, EmailRejected))

@@ -1,44 +1,59 @@
 from __future__ import annotations
 
-import email
-from dataclasses import dataclass
-from email.header import decode_header
-from email.message import Message
+import imaplib
+import ssl
+from dataclasses import replace
 
 from imapclient import IMAPClient
 
-from jev_mail.config import MailboxConfig
+from jev_mail.config import Decision, MailboxConfig
+from jev_mail.email_state import Email, message_key, parse_email
+from jev_mail.store import ProcessedStore
 
-PROCESSED_KEYWORD = "$JevProcessed"
+HEADER_CHUNK = 500
+IDENTITY_FETCH = "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID DATE FROM SUBJECT)]"
 
 
-@dataclass
-class Email:
-    uid: int
-    subject: str
-    body: str
+def _ssl_context(config: MailboxConfig) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if not config.tls_verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
 
-    @property
-    def state(self) -> str:
-        return f"Subject: {self.subject}\n\n{self.body}"
+
+def _connect(config: MailboxConfig) -> IMAPClient:
+    context = _ssl_context(config)
+    if config.security == "ssl":
+        server = IMAPClient(config.host, port=config.port, ssl=True, ssl_context=context, use_uid=True)
+    else:
+        server = IMAPClient(config.host, port=config.port, ssl=False, use_uid=True)
+        server.starttls(context)
+    server.login(config.username, config.password)
+    return server
 
 
 class Mailbox:
-    """Thin wrapper around imapclient.IMAPClient: fetch unprocessed mail and
-    apply the primitive actions (tag/move/flag/seen). Use as a context
-    manager so the connection always gets closed."""
+    """Thin wrapper around imapclient.IMAPClient: fetch mail the store hasn't
+    recorded and apply a Decision to it. Use as a context manager so the
+    connection always gets closed. `store` may be None only for read-only
+    folder checks."""
 
-    def __init__(self, config: MailboxConfig, server: IMAPClient | None = None):
+    def __init__(
+        self, config: MailboxConfig, store: ProcessedStore | None = None, server: IMAPClient | None = None
+    ):
         self._config = config
+        self._store = store
+        self._folder = ""
+        self._uidvalidity = 0
         # `server` is an injection point for tests; production code always
         # leaves it unset and lets __enter__ create the real connection.
         self._server = server
+        self._folder_names: set[str] | None = None
 
     def __enter__(self) -> "Mailbox":
         if self._server is None:
-            self._server = IMAPClient(self._config.host, port=self._config.port, use_uid=True)
-            self._server.login(self._config.username, self._config.password)
-            self._server.select_folder(self._config.folder)
+            self._server = _connect(self._config)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -48,44 +63,86 @@ class Mailbox:
             except Exception:
                 pass
 
-    def fetch_unprocessed(self, limit: int | None = None) -> list[Email]:
-        """`limit` caps how many messages get fetched+classified in one call
-        -- keeps a single run/poll bounded (cost, rate limits, one huge
-        backlog) instead of processing an entire inbox at once.
+    def select(self, folder: str) -> None:
+        info = self._server.select_folder(folder)
+        self._folder = folder
+        self._uidvalidity = int(info[b"UIDVALIDITY"])
 
-        IMAP UIDs increase monotonically with arrival, and SEARCH returns
-        them in ascending order -- sort descending so a capped run picks up
-        the newest unprocessed mail first, not whatever's oldest in a big
-        backlog."""
-        uids = self._server.search(["UNKEYWORD", PROCESSED_KEYWORD])
-        if not uids:
-            return []
-        uids = sorted(uids, reverse=True)
+    def capabilities(self) -> list[str]:
+        return sorted(c.decode() if isinstance(c, bytes) else c for c in self._server.capabilities())
+
+    def _sync_identities(self) -> list[int]:
+        """Map every UID in the selected folder to its message key, fetching
+        headers only for UIDs not seen under this UIDVALIDITY. Returns all UIDs."""
+        uids = self._server.search(["ALL"])
+        known = self._store.mapped_uids(self._folder, self._uidvalidity)
+        missing = sorted(set(uids) - known, reverse=True)
+        for start in range(0, len(missing), HEADER_CHUNK):
+            response = self._server.fetch(missing[start : start + HEADER_CHUNK], [IDENTITY_FETCH])
+            keys = {
+                uid: message_key(next(v for k, v in data.items() if k.startswith(b"BODY[HEADER.FIELDS")))
+                for uid, data in response.items()
+            }
+            self._store.map_uids(self._folder, self._uidvalidity, keys)
+        return uids
+
+    def counts(self) -> tuple[int, int]:
+        """(messages in the selected folder, messages the store hasn't recorded)."""
+        uids = self._sync_identities()
+        return len(uids), len(self._store.unprocessed_uids(self._folder, self._uidvalidity, uids))
+
+    def fetch_unprocessed(self, limit: int | None = None) -> list[Email]:
+        """Newest unrecorded mail first (UIDs grow with arrival). Uses
+        BODY.PEEK so fetching never sets \\Seen, and a partial fetch so one
+        huge message can't blow the bandwidth budget."""
+        uids = self._store.unprocessed_uids(self._folder, self._uidvalidity, self._sync_identities())
         if limit is not None:
             uids = uids[:limit]
-        response = self._server.fetch(uids, ["RFC822"])
+        if not uids:
+            return []
+        keys = self._store.keys(self._folder, self._uidvalidity, uids)
+        response = self._server.fetch(uids, [f"BODY.PEEK[]<0.{self._config.max_fetch_bytes}>"])
         emails = []
-        for uid, data in response.items():
-            msg = email.message_from_bytes(data[b"RFC822"])
-            emails.append(Email(uid=uid, subject=_decode_subject(msg), body=_extract_body(msg)))
+        for uid in sorted(response, reverse=True):
+            # imapclient keys a partial fetch as BODY[]<origin>, not BODY.PEEK[]
+            raw = next(v for k, v in response[uid].items() if k.startswith(b"BODY[]"))
+            emails.append(replace(parse_email(uid, raw), message_key=keys[uid]))
         return emails
 
-    def mark_processed(self, uid: int) -> None:
-        self._server.add_flags([uid], [PROCESSED_KEYWORD])
+    def apply(self, uid: int, decision: Decision) -> None:
+        """The caller records the message in the store afterwards. A crash
+        before that only repeats idempotent COPYs on a message still in the
+        folder, and a moved message has already left the watched folder."""
+        for label in decision.labels:
+            self._server.copy([uid], label)
+        if decision.destination:
+            self._server.move([uid], decision.destination)
 
-    def add_tag(self, uid: int, value: str) -> None:
-        self._server.add_flags([uid], [value])
+    def ensure_folders(self, names: list[str]) -> None:
+        """Create the missing folders, one at a time, before any COPY or MOVE.
+        Proton Bridge deadlocks every later write on the account when label
+        creation overlaps other traffic (observed: a burst of label creates,
+        then UID COPY/MOVE hung until Bridge was restarted)."""
+        self._folder_names = None
+        for name in names:
+            if name in self._folders():
+                continue
+            try:
+                self._server.create_folder(name)
+            except imaplib.IMAP4.error:
+                self._folder_names = None
+                if name not in self._folders():
+                    raise
+                continue
+            self._folder_names.add(name)
 
-    def move(self, uid: int, folder: str) -> None:
-        if folder not in (name for _, _, name in self._server.list_folders()):
-            self._server.create_folder(folder)
-        self._server.move([uid], folder)
+    def folder_exists(self, name: str) -> bool:
+        return name in self._folders()
 
-    def set_flag(self, uid: int, flagged: bool) -> None:
-        (self._server.add_flags if flagged else self._server.remove_flags)([uid], [b"\\Flagged"])
-
-    def set_seen(self, uid: int, seen: bool) -> None:
-        (self._server.add_flags if seen else self._server.remove_flags)([uid], [b"\\Seen"])
+    def _folders(self) -> set[str]:
+        if self._folder_names is None:
+            self._folder_names = {name for _, _, name in self._server.list_folders()}
+        return self._folder_names
 
     def supports_idle(self) -> bool:
         return bool(self._server.has_capability("IDLE"))
@@ -98,29 +155,3 @@ class Mailbox:
 
     def idle_done(self) -> None:
         self._server.idle_done()
-
-
-def _decode_subject(msg: Message) -> str:
-    raw = msg.get("Subject", "")
-    parts = decode_header(raw)
-    return "".join(
-        part.decode(encoding or "utf-8", errors="replace") if isinstance(part, bytes) else part
-        for part, encoding in parts
-    )
-
-
-def _extract_body(msg: Message) -> str:
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain" and not part.get_filename():
-                return _decode_payload(part)
-        return ""
-    return _decode_payload(msg)
-
-
-def _decode_payload(part: Message) -> str:
-    payload = part.get_payload(decode=True)
-    if payload is None:
-        return ""
-    charset = part.get_content_charset() or "utf-8"
-    return payload.decode(charset, errors="replace")

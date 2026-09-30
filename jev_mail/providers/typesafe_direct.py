@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from .base import ProviderError, build_noul_questions, describe_http_error, extract_probabilities
+from .base import build_noul_questions, extract_probabilities, to_provider_error
 
 SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone"
 
@@ -27,6 +27,6 @@ class TypeSafeDirectClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise ProviderError(f"TypeSafe API request failed: {describe_http_error(exc)}") from exc
+            raise to_provider_error("TypeSafe API", exc) from exc
 
         return extract_probabilities(response.json().get("answers", {}), list(categories))

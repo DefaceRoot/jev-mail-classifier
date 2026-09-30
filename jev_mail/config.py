@@ -4,66 +4,60 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, get_args
 
 import yaml
 from dotenv import load_dotenv
 
 _VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-ACTION_TYPES = ("tag", "move", "flag", "unflag", "mark_read", "mark_unread", "webhook")
+Disposition = Literal["keep", "archive", "quarantine"]
+DISPOSITIONS: tuple[str, ...] = get_args(Disposition)
+SECURITY_MODES = ("ssl", "starttls")
 
 
 class ConfigError(Exception):
     """Raised for a malformed or incomplete config.yaml."""
 
 
-@dataclass
-class Action:
-    type: str
-    value: str | None = None
-    folder: str | None = None
-    url: str | None = None
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "Action":
-        if data.get("type") not in ACTION_TYPES:
-            raise ConfigError(f"unknown action type: {data.get('type')!r}")
-        return cls(type=data["type"], value=data.get("value"), folder=data.get("folder"), url=data.get("url"))
-
-    def to_dict(self) -> dict:
-        out: dict = {"type": self.type}
-        if self.value is not None:
-            out["value"] = self.value
-        if self.folder is not None:
-            out["folder"] = self.folder
-        if self.url is not None:
-            out["url"] = self.url
-        return out
-
-
-@dataclass
+@dataclass(frozen=True)
 class Category:
     name: str
+    label: str
     description: str
     threshold: float | None = None
-    actions: list[Action] = field(default_factory=list)
+    disposition: Disposition | None = None
+    disposition_threshold: float | None = None
+
+
+@dataclass(frozen=True)
+class Decision:
+    labels: tuple[str, ...]
+    destination: str | None
+    probabilities: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
 class MailboxConfig:
     host: str
     port: int = 993
+    security: str = "ssl"
+    tls_verify: bool = True
     username: str = ""
     password: str = ""
-    folder: str = "INBOX"
-    poll_interval_seconds: int = 60
-    max_emails_per_run: int = 25
+    watch_folders: list[str] = field(default_factory=lambda: ["INBOX"])
+    batch_size: int = 25
+    max_fetch_bytes: int = 524288
+    poll_interval_seconds: int = 600
+    label_folder: str = "JEV/{label}"
+    folders: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class JevSettings:
     provider: str = "auto"
-    default_threshold: float = 0.6
+    model: str | None = None
+    default_threshold: float = 0.7
 
 
 @dataclass
@@ -71,9 +65,26 @@ class AppConfig:
     mailbox: MailboxConfig
     jev: JevSettings
     categories: list[Category]
+    unmatched_label: str = "REVIEW"
+    state_path: str = "/state/jev-mail.sqlite"
 
     def category_threshold(self, category: Category) -> float:
         return category.threshold if category.threshold is not None else self.jev.default_threshold
+
+    def disposition_threshold(self, category: Category) -> float:
+        if category.disposition_threshold is not None:
+            return category.disposition_threshold
+        return self.category_threshold(category)
+
+    def label_folder(self, label: str) -> str:
+        return self.mailbox.label_folder.format(label=label)
+
+    def writable_folders(self) -> list[str]:
+        """Every folder a Decision can COPY or MOVE into, in a stable order."""
+        names = [self.label_folder(c.label) for c in self.categories]
+        names.append(self.label_folder(self.unmatched_label))
+        names.extend(self.mailbox.folders.values())
+        return list(dict.fromkeys(names))
 
 
 def _interpolate(value: str, env: dict) -> str:
@@ -86,104 +97,112 @@ def _interpolate(value: str, env: dict) -> str:
     return _VAR_PATTERN.sub(repl, value) if isinstance(value, str) else value
 
 
+def _parse_category(raw: object) -> Category:
+    if not isinstance(raw, dict):
+        raise ConfigError(f"each entry in categories must be a mapping, got {raw!r}")
+    for key in ("name", "label", "description"):
+        if not raw.get(key):
+            raise ConfigError(f"category {raw.get('name', raw)!r} is missing {key!r}")
+    disposition = raw.get("disposition")
+    if disposition is not None and disposition not in DISPOSITIONS:
+        raise ConfigError(
+            f"category {raw['name']!r} has disposition {disposition!r}; expected one of {', '.join(DISPOSITIONS)}"
+        )
+    threshold = raw.get("threshold")
+    disposition_threshold = raw.get("disposition_threshold")
+    if disposition_threshold is not None and disposition is None:
+        raise ConfigError(f"category {raw['name']!r} sets disposition_threshold without a disposition")
+    return Category(
+        name=raw["name"],
+        label=raw["label"],
+        description=raw["description"],
+        threshold=float(threshold) if threshold is not None else None,
+        disposition=disposition,
+        disposition_threshold=float(disposition_threshold) if disposition_threshold is not None else None,
+    )
+
+
 def load_config(config_path: str | Path, env_path: str | Path | None = None) -> AppConfig:
     config_path = Path(config_path)
     load_dotenv(env_path or config_path.parent / ".env", override=False)
 
     if not config_path.exists():
-        raise ConfigError(f"no config file at {config_path} — run `jev-mail configure` first")
+        raise ConfigError(f"no config file at {config_path}")
 
     raw = yaml.safe_load(config_path.read_text()) or {}
     env = dict(os.environ)
 
-    mb_raw = raw.get("mailbox", {})
+    mb_raw = raw.get("mailbox") or {}
+    if "folder" in mb_raw:
+        raise ConfigError("mailbox.folder was replaced by mailbox.watch_folders (a list)")
     mailbox = MailboxConfig(
         host=_interpolate(mb_raw.get("host", ""), env),
         port=int(mb_raw.get("port", 993)),
+        security=mb_raw.get("security", "ssl"),
+        tls_verify=bool(mb_raw.get("tls_verify", True)),
         username=_interpolate(mb_raw.get("username", ""), env),
         password=_interpolate(mb_raw.get("password", ""), env),
-        folder=mb_raw.get("folder", "INBOX"),
-        poll_interval_seconds=int(mb_raw.get("poll_interval_seconds", 60)),
-        max_emails_per_run=int(mb_raw.get("max_emails_per_run", 25)),
+        watch_folders=mb_raw.get("watch_folders", ["INBOX"]),
+        batch_size=int(mb_raw.get("batch_size", 25)),
+        max_fetch_bytes=int(mb_raw.get("max_fetch_bytes", 524288)),
+        poll_interval_seconds=int(mb_raw.get("poll_interval_seconds", 600)),
+        label_folder=mb_raw.get("label_folder", "JEV/{label}"),
+        folders=dict(mb_raw.get("folders") or {}),
     )
     if not mailbox.host:
-        raise ConfigError("mailbox.host is empty — run `jev-mail configure` and fill in the IMAP host")
+        raise ConfigError("mailbox.host is empty")
+    folders = mailbox.watch_folders
+    if not isinstance(folders, list) or not folders or not all(isinstance(f, str) and f for f in folders):
+        raise ConfigError("mailbox.watch_folders must be a non-empty list of folder names")
+    if len(set(folders)) != len(folders):
+        raise ConfigError("mailbox.watch_folders has duplicates")
+    if mailbox.security not in SECURITY_MODES:
+        raise ConfigError(f"mailbox.security must be one of {', '.join(SECURITY_MODES)}, got {mailbox.security!r}")
+    if "{label}" not in mailbox.label_folder:
+        raise ConfigError("mailbox.label_folder must contain {label}")
+    if mailbox.batch_size < 1:
+        raise ConfigError("mailbox.batch_size must be at least 1")
+    unknown_folders = set(mailbox.folders) - {"archive", "quarantine"}
+    if unknown_folders:
+        raise ConfigError(f"unknown mailbox.folders key(s): {', '.join(sorted(unknown_folders))}")
 
-    jev_raw = raw.get("jev", {})
+    jev_raw = raw.get("jev") or {}
     jev = JevSettings(
         provider=jev_raw.get("provider", "auto"),
-        default_threshold=float(jev_raw.get("default_threshold", 0.6)),
+        model=jev_raw.get("model"),
+        default_threshold=float(jev_raw.get("default_threshold", 0.7)),
     )
 
-    categories = [
-        Category(
-            name=name,
-            description=cat_raw.get("description", ""),
-            threshold=cat_raw.get("threshold"),
-            actions=[Action.from_dict(a) for a in cat_raw.get("actions", [])],
-        )
-        for name, cat_raw in (raw.get("categories") or {}).items()
-    ]
+    state_path = raw.get("state_path", "/state/jev-mail.sqlite")
+    if not isinstance(state_path, str) or not state_path:
+        raise ConfigError("state_path must be a non-empty file path")
+
+    raw_categories = raw.get("categories")
+    if isinstance(raw_categories, dict):
+        raise ConfigError("categories must be a list of {name, label, description, ...} entries, not a mapping")
+    categories = [_parse_category(c) for c in raw_categories or []]
     if not categories:
-        raise ConfigError("config has no categories — run `jev-mail configure` to add some")
+        raise ConfigError("config has no categories")
+    names = [c.name for c in categories]
+    if len(set(names)) != len(names):
+        raise ConfigError("category names must be unique")
+    for category in categories:
+        label_threshold = category.threshold if category.threshold is not None else jev.default_threshold
+        if category.disposition_threshold is not None and category.disposition_threshold < label_threshold:
+            raise ConfigError(
+                f"category {category.name!r} has disposition_threshold {category.disposition_threshold} "
+                f"below its label threshold {label_threshold}"
+            )
+        if category.disposition in ("archive", "quarantine") and category.disposition not in mailbox.folders:
+            raise ConfigError(
+                f"category {category.name!r} uses disposition {category.disposition!r} "
+                f"but mailbox.folders.{category.disposition} isn't set"
+            )
 
-    return AppConfig(mailbox=mailbox, jev=jev, categories=categories)
-
-
-def save_config(config: AppConfig, config_path: str | Path) -> None:
-    """Writes config.yaml. Mailbox credentials are always written as ${VAR}
-    references, never as literal secrets, regardless of what's loaded in memory."""
-    raw = {
-        "mailbox": {
-            "host": config.mailbox.host,
-            "port": config.mailbox.port,
-            "username": "${IMAP_USERNAME}",
-            "password": "${IMAP_PASSWORD}",
-            "folder": config.mailbox.folder,
-            "poll_interval_seconds": config.mailbox.poll_interval_seconds,
-            "max_emails_per_run": config.mailbox.max_emails_per_run,
-        },
-        "jev": {
-            "provider": config.jev.provider,
-            "default_threshold": config.jev.default_threshold,
-        },
-        "categories": {
-            cat.name: {
-                "description": cat.description,
-                **({"threshold": cat.threshold} if cat.threshold is not None else {}),
-                "actions": [a.to_dict() for a in cat.actions],
-            }
-            for cat in config.categories
-        },
-    }
-    Path(config_path).write_text(yaml.safe_dump(raw, sort_keys=False, default_flow_style=False))
-
-
-def read_env(env_path: str | Path) -> dict[str, str]:
-    """Parses a .env file into a plain dict, or {} if it doesn't exist yet."""
-    env_path = Path(env_path)
-    values: dict[str, str] = {}
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            values[key.strip()] = val.strip()
-    return values
-
-
-def save_env(values: dict[str, str], env_path: str | Path) -> None:
-    """Merges `values` into the .env file at `env_path`: a non-empty value
-    sets that key, an empty value removes it. Keys not present in `values`
-    at all are left untouched. (The credentials screen pre-fills every field
-    from the existing .env, so an empty field here means the user actually
-    cleared it -- not "didn't get around to typing anything.")"""
-    env_path = Path(env_path)
-    existing = read_env(env_path)
-    for key, value in values.items():
-        if value:
-            existing[key] = value
-        else:
-            existing.pop(key, None)
-    env_path.write_text("".join(f"{k}={v}\n" for k, v in existing.items()))
+    return AppConfig(
+        mailbox=mailbox,
+        jev=jev,
+        categories=categories,
+        unmatched_label=raw.get("unmatched_label", "REVIEW"),
+        state_path=state_path,
+    )

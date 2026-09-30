@@ -16,15 +16,5 @@ python3 -m venv .venv
 chmod +x "$here/jev-mail"
 
 echo ""
-echo "Installed. From now on, run it from this directory with ./jev-mail"
-echo "(e.g. ./jev-mail run --dry-run) -- no venv activation needed."
-echo ""
-
-if [ -f "$here/config.yaml" ]; then
-  echo "config.yaml already exists -- skipping the setup wizard."
-  echo "Run './jev-mail configure' any time to add/edit categories or credentials."
-else
-  echo "Launching the setup wizard (paste one API key + your IMAP login)..."
-  echo ""
-  exec "$here/jev-mail" configure
-fi
+echo "Installed. Copy config.example.yaml to config.yaml and .env.example to .env,"
+echo "fill them in, then run ./jev-mail run --dry-run"
