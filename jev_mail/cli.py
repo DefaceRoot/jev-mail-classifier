@@ -26,16 +26,14 @@ def _process_unprocessed(mailbox: Mailbox, client: JevClient, config: AppConfig,
             "there may be more unprocessed mail left for next run"
         )
     for mail in emails:
-        probabilities = classify(client, config, mail.state)
+        probabilities = classify(client, config, mail.state())
         decision = decide(config, probabilities)
 
         if dry_run:
             print(f"[dry-run] {mail.subject!r}: {', '.join(decision.labels)} -> {decision.destination}")
 
-        # Mark processed even when nothing matched -- otherwise a never-matching
-        # email gets reclassified (and re-billed) on every future run.
         if not dry_run:
-            mailbox.mark_processed(mail.uid)
+            mailbox.apply(mail.uid, decision)
 
 
 def _mailbox_error_message(exc: Exception, config: AppConfig) -> str:

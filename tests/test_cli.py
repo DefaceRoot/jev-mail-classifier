@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 
 import jev_mail.cli as cli
 from tests.factories import make_config, probs
-from jev_mail.mailbox import Email
+from jev_mail.email_state import Email
 
 
 _config = make_config
@@ -35,7 +35,7 @@ def test_process_unprocessed_passes_limit_to_fetch():
 
 def test_process_unprocessed_warns_when_limit_is_hit(capsys):
     mailbox = MagicMock()
-    mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="One", body="body")]
+    mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="One", headers="Subject: One", body="body")]
     client = MagicMock()
     client.decide.return_value = probs(receipt=0.9)
 
@@ -48,36 +48,38 @@ def test_process_unprocessed_warns_when_limit_is_hit(capsys):
 
 def test_process_unprocessed_dry_run_does_not_mutate_mailbox(capsys):
     mailbox = MagicMock()
-    mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Invoice #1", body="Please pay")]
+    mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Invoice #1", headers="Subject: Invoice #1", body="Please pay")]
     client = MagicMock()
     client.decide.return_value = probs(receipt=0.9)
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=True)
 
-    mailbox.mark_processed.assert_not_called()
+    mailbox.apply.assert_not_called()
     assert "dry-run" in capsys.readouterr().out
 
 
 def test_process_unprocessed_marks_processed():
     mailbox = MagicMock()
-    mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Invoice #1", body="Please pay")]
+    mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Invoice #1", headers="Subject: Invoice #1", body="Please pay")]
     client = MagicMock()
     client.decide.return_value = probs(receipt=0.9)
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=False)
 
-    mailbox.mark_processed.assert_called_once_with(1)
+    mailbox.apply.assert_called_once()
+    assert mailbox.apply.call_args.args[0] == 1
 
 
 def test_process_unprocessed_below_threshold_no_actions():
     mailbox = MagicMock()
-    mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Newsletter", body="...")]
+    mailbox.fetch_unprocessed.return_value = [Email(uid=1, subject="Newsletter", headers="Subject: Newsletter", body="...")]
     client = MagicMock()
     client.decide.return_value = probs()
 
     cli._process_unprocessed(mailbox, client, _config(), dry_run=False)
 
-    mailbox.mark_processed.assert_called_once_with(1)
+    mailbox.apply.assert_called_once()
+    assert mailbox.apply.call_args.args[0] == 1
 
 
 def test_cmd_run_reports_config_error(monkeypatch, capsys):

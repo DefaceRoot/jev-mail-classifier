@@ -1,44 +1,51 @@
 from __future__ import annotations
 
-import email
-from dataclasses import dataclass
-from email.header import decode_header
-from email.message import Message
+import imaplib
+import ssl
 
 from imapclient import IMAPClient
 
-from jev_mail.config import MailboxConfig
+from jev_mail.config import Decision, MailboxConfig
+from jev_mail.email_state import Email, parse_email
 
 PROCESSED_KEYWORD = "$JevProcessed"
 
 
-@dataclass
-class Email:
-    uid: int
-    subject: str
-    body: str
+def _ssl_context(config: MailboxConfig) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if not config.tls_verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
 
-    @property
-    def state(self) -> str:
-        return f"Subject: {self.subject}\n\n{self.body}"
+
+def _connect(config: MailboxConfig) -> IMAPClient:
+    context = _ssl_context(config)
+    if config.security == "ssl":
+        server = IMAPClient(config.host, port=config.port, ssl=True, ssl_context=context, use_uid=True)
+    else:
+        server = IMAPClient(config.host, port=config.port, ssl=False, use_uid=True)
+        server.starttls(context)
+    server.login(config.username, config.password)
+    server.select_folder(config.folder)
+    return server
 
 
 class Mailbox:
     """Thin wrapper around imapclient.IMAPClient: fetch unprocessed mail and
-    apply the primitive actions. Use as a context
-    manager so the connection always gets closed."""
+    apply a Decision to it. Use as a context manager so the connection always
+    gets closed."""
 
     def __init__(self, config: MailboxConfig, server: IMAPClient | None = None):
         self._config = config
         # `server` is an injection point for tests; production code always
         # leaves it unset and lets __enter__ create the real connection.
         self._server = server
+        self._folder_names: set[str] | None = None
 
     def __enter__(self) -> "Mailbox":
         if self._server is None:
-            self._server = IMAPClient(self._config.host, port=self._config.port, use_uid=True)
-            self._server.login(self._config.username, self._config.password)
-            self._server.select_folder(self._config.folder)
+            self._server = _connect(self._config)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -48,35 +55,75 @@ class Mailbox:
             except Exception:
                 pass
 
-    def fetch_unprocessed(self, limit: int | None = None) -> list[Email]:
-        """`limit` caps how many messages get fetched+classified in one call
-        -- keeps a single run/poll bounded (cost, rate limits, one huge
-        backlog) instead of processing an entire inbox at once.
+    def capabilities(self) -> list[str]:
+        return sorted(c.decode() if isinstance(c, bytes) else c for c in self._server.capabilities())
 
-        IMAP UIDs increase monotonically with arrival, and SEARCH returns
-        them in ascending order -- sort descending so a capped run picks up
-        the newest unprocessed mail first, not whatever's oldest in a big
-        backlog."""
-        uids = self._server.search(["UNKEYWORD", PROCESSED_KEYWORD])
-        if not uids:
-            return []
-        uids = sorted(uids, reverse=True)
+    def unprocessed_uids(self) -> list[int]:
+        return sorted(self._server.search(["UNKEYWORD", PROCESSED_KEYWORD]), reverse=True)
+
+    def fetch_unprocessed(self, limit: int | None = None) -> list[Email]:
+        """Newest unprocessed mail first (UIDs grow with arrival). Uses
+        BODY.PEEK so fetching never sets \\Seen, and a partial fetch so one
+        huge message can't blow the bandwidth budget."""
+        uids = self.unprocessed_uids()
         if limit is not None:
             uids = uids[:limit]
-        response = self._server.fetch(uids, ["RFC822"])
+        if not uids:
+            return []
+        response = self._server.fetch(uids, [f"BODY.PEEK[]<0.{self._config.max_fetch_bytes}>"])
         emails = []
-        for uid, data in response.items():
-            msg = email.message_from_bytes(data[b"RFC822"])
-            emails.append(Email(uid=uid, subject=_decode_subject(msg), body=_extract_body(msg)))
+        for uid in sorted(response, reverse=True):
+            # imapclient keys a partial fetch as BODY[]<origin>, not BODY.PEEK[]
+            raw = next(v for k, v in response[uid].items() if k.startswith(b"BODY[]"))
+            emails.append(parse_email(uid, raw))
         return emails
 
-    def mark_processed(self, uid: int) -> None:
+    def apply(self, uid: int, decision: Decision) -> None:
+        """Order matters. Label COPYs are idempotent, so a crash before the
+        marker only repeats them. The marker is set before the MOVE so a crash
+        in between never leaves a moved message looking unprocessed."""
+        for label in decision.labels:
+            self._ensure_folder(label)
+            self._server.copy([uid], label)
         self._server.add_flags([uid], [PROCESSED_KEYWORD])
+        if decision.destination:
+            self._ensure_folder(decision.destination)
+            self._server.move([uid], decision.destination)
 
-    def move(self, uid: int, folder: str) -> None:
-        if folder not in (name for _, _, name in self._server.list_folders()):
-            self._server.create_folder(folder)
-        self._server.move([uid], folder)
+    def folder_exists(self, name: str) -> bool:
+        return name in self._folders()
+
+    def newest_uid(self) -> int | None:
+        uids = self._server.search(["ALL"])
+        return max(uids) if uids else None
+
+    def keywords(self, uid: int) -> set[str]:
+        flags = self._server.get_flags([uid]).get(uid, ())
+        return {f.decode() if isinstance(f, bytes) else f for f in flags}
+
+    def add_keyword(self, uid: int, keyword: str) -> None:
+        self._server.add_flags([uid], [keyword])
+
+    def remove_keyword(self, uid: int, keyword: str) -> None:
+        self._server.remove_flags([uid], [keyword])
+
+    def _folders(self) -> set[str]:
+        if self._folder_names is None:
+            self._folder_names = {name for _, _, name in self._server.list_folders()}
+        return self._folder_names
+
+    def _ensure_folder(self, name: str) -> None:
+        if name in self._folders():
+            return
+        try:
+            self._server.create_folder(name)
+        except imaplib.IMAP4.error:
+            # Another process on the same account may have created it first.
+            self._folder_names = None
+            if name not in self._folders():
+                raise
+            return
+        self._folder_names.add(name)
 
     def supports_idle(self) -> bool:
         return bool(self._server.has_capability("IDLE"))
@@ -89,29 +136,3 @@ class Mailbox:
 
     def idle_done(self) -> None:
         self._server.idle_done()
-
-
-def _decode_subject(msg: Message) -> str:
-    raw = msg.get("Subject", "")
-    parts = decode_header(raw)
-    return "".join(
-        part.decode(encoding or "utf-8", errors="replace") if isinstance(part, bytes) else part
-        for part, encoding in parts
-    )
-
-
-def _extract_body(msg: Message) -> str:
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain" and not part.get_filename():
-                return _decode_payload(part)
-        return ""
-    return _decode_payload(msg)
-
-
-def _decode_payload(part: Message) -> str:
-    payload = part.get_payload(decode=True)
-    if payload is None:
-        return ""
-    charset = part.get_content_charset() or "utf-8"
-    return payload.decode(charset, errors="replace")
