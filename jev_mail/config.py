@@ -45,7 +45,7 @@ class MailboxConfig:
     tls_verify: bool = True
     username: str = ""
     password: str = ""
-    folder: str = "INBOX"
+    watch_folders: list[str] = field(default_factory=lambda: ["INBOX"])
     batch_size: int = 25
     max_fetch_bytes: int = 524288
     poll_interval_seconds: int = 600
@@ -77,6 +77,13 @@ class AppConfig:
 
     def label_folder(self, label: str) -> str:
         return self.mailbox.label_folder.format(label=label)
+
+    def writable_folders(self) -> list[str]:
+        """Every folder a Decision can COPY or MOVE into, in a stable order."""
+        names = [self.label_folder(c.label) for c in self.categories]
+        names.append(self.label_folder(self.unmatched_label))
+        names.extend(self.mailbox.folders.values())
+        return list(dict.fromkeys(names))
 
 
 def _interpolate(value: str, env: dict) -> str:
@@ -125,6 +132,8 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
     env = dict(os.environ)
 
     mb_raw = raw.get("mailbox") or {}
+    if "folder" in mb_raw:
+        raise ConfigError("mailbox.folder was replaced by mailbox.watch_folders (a list)")
     mailbox = MailboxConfig(
         host=_interpolate(mb_raw.get("host", ""), env),
         port=int(mb_raw.get("port", 993)),
@@ -132,7 +141,7 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
         tls_verify=bool(mb_raw.get("tls_verify", True)),
         username=_interpolate(mb_raw.get("username", ""), env),
         password=_interpolate(mb_raw.get("password", ""), env),
-        folder=mb_raw.get("folder", "INBOX"),
+        watch_folders=mb_raw.get("watch_folders", ["INBOX"]),
         batch_size=int(mb_raw.get("batch_size", 25)),
         max_fetch_bytes=int(mb_raw.get("max_fetch_bytes", 524288)),
         poll_interval_seconds=int(mb_raw.get("poll_interval_seconds", 600)),
@@ -141,6 +150,11 @@ def load_config(config_path: str | Path, env_path: str | Path | None = None) -> 
     )
     if not mailbox.host:
         raise ConfigError("mailbox.host is empty")
+    folders = mailbox.watch_folders
+    if not isinstance(folders, list) or not folders or not all(isinstance(f, str) and f for f in folders):
+        raise ConfigError("mailbox.watch_folders must be a non-empty list of folder names")
+    if len(set(folders)) != len(folders):
+        raise ConfigError("mailbox.watch_folders has duplicates")
     if mailbox.security not in SECURITY_MODES:
         raise ConfigError(f"mailbox.security must be one of {', '.join(SECURITY_MODES)}, got {mailbox.security!r}")
     if "{label}" not in mailbox.label_folder:

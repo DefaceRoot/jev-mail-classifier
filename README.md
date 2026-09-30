@@ -40,24 +40,23 @@ docker run --rm -v "$PWD/data:/data" jev-mail check
 ```
 
 Options go before the command: `jev-mail --dir DIR --folder NAME <command>`.
-`--folder` overrides `mailbox.folder`, so one config can be served by one process per
-folder (IDLE watches a single selected folder):
+`mailbox.watch_folders` lists the folders one process covers. `--folder` is repeatable
+and replaces that list for a single invocation:
 
 ```bash
-jev-mail --folder INBOX watch
-jev-mail --folder "Folders/Bay Bravo" watch
+jev-mail --folder INBOX --folder "Folders/Bay Bravo" watch
 ```
 
-Two processes on one account may create the same label folder at the same time. An
-"already exists" failure is tolerated.
+Run one process per account. Every label and destination folder is created once at
+startup, before any COPY or MOVE, and a folder another process created first is tolerated.
 
 ## Commands
 
 | Command | Behaviour |
 | --- | --- |
-| `run` | Processes batches of `mailbox.batch_size` until a batch comes back smaller, so it backfills a whole inbox. `--dry-run` processes exactly one batch without writing (`--limit N` sets its size). |
-| `watch` | Drains the backlog, then waits on IDLE (re-armed every `poll_interval_seconds`, at most 600) and drains again. |
-| `check` | Logs in, selects the folder, prints capabilities and the unprocessed count, and verifies that custom keywords persist by storing `$JevProbe` on the newest message, reconnecting, reading it back and removing it. Exits non-zero if the keyword does not persist or `folders.archive` is missing. |
+| `run` | Creates any missing label and destination folders, then for each watch folder in order processes batches of `mailbox.batch_size` until a batch comes back smaller, so it backfills whole folders. `--dry-run` creates nothing and processes exactly one batch per folder without writing (`--limit N` sets its size). |
+| `watch` | Creates missing folders, drains every watch folder in order, then waits on IDLE in the first one (up to `poll_interval_seconds`, at most 600) and repeats, so the other folders are rechecked at least that often. |
+| `check` | Logs in, prints capabilities and the unprocessed count per watch folder, and verifies that custom keywords persist by storing `$JevProbe` on the newest message of the first watch folder, reconnecting, reading it back and removing it. Exits non-zero if a watch folder or `folders.archive` is missing, or the keyword does not persist. |
 
 Each email logs one line to stdout: uid, subject (80 chars), labels, destination and the
 top three probabilities. Bodies are never logged.
@@ -108,6 +107,10 @@ Bridge serves IMAP only on port 143 with STARTTLS and a self-signed certificate,
 cannot be nested (`Labels/JEV/X` fails), so use `label_folder: "Labels/JEV-{label}"`. Real
 folders live under `Folders/`, and the archive folder is `Archive`. Custom keywords such
 as `$JevProcessed` persist even though `PERMANENTFLAGS` lacks `\*`. Run `check` to confirm.
+
+Run one `jev-mail` process per Bridge account and list every folder in
+`watch_folders` (for example `[INBOX, "Folders/Bay Bravo"]`). Two processes creating
+labels and copying at once deadlocked Bridge, hanging every write until it was restarted.
 
 ## Gmail
 

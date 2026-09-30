@@ -58,49 +58,64 @@ def test_fetch_returns_empty_without_fetching_when_nothing_unprocessed():
     server.fetch.assert_not_called()
 
 
-def test_apply_copies_labels_then_marks_processed_then_moves():
+def test_apply_copies_labels_then_marks_processed_then_moves_and_never_creates():
     server = _server()
     decision = Decision(labels=("Labels/JEV-SCAM", "Labels/JEV-SECURITY"), destination="Folders/JEV Quarantine")
 
     with _mailbox(server) as mailbox:
         mailbox.apply(42, decision)
 
-    actions = [c for c in server.mock_calls if c[0] in {"create_folder", "copy", "add_flags", "move"}]
-    assert actions == [
-        call.create_folder("Labels/JEV-SCAM"),
+    assert server.mock_calls == [
         call.copy([42], "Labels/JEV-SCAM"),
-        call.create_folder("Labels/JEV-SECURITY"),
         call.copy([42], "Labels/JEV-SECURITY"),
         call.add_flags([42], [PROCESSED_KEYWORD]),
-        call.create_folder("Folders/JEV Quarantine"),
         call.move([42], "Folders/JEV Quarantine"),
+        call.logout(),
     ]
 
 
 def test_apply_without_destination_never_moves():
-    server = _server(folders=("INBOX", "Labels/JEV-REVIEW"))
+    server = _server()
 
     with _mailbox(server) as mailbox:
         mailbox.apply(7, Decision(labels=("Labels/JEV-REVIEW",), destination=None))
 
-    server.create_folder.assert_not_called()
     server.move.assert_not_called()
     assert server.add_flags.call_args == call([7], [PROCESSED_KEYWORD])
 
 
-def test_folder_list_is_fetched_once_per_connection():
+def test_apply_lets_a_missing_target_folder_error_propagate():
+    server = _server()
+    server.copy.side_effect = imaplib.IMAP4.error("COPY failed: no such mailbox")
+
+    with _mailbox(server) as mailbox, pytest.raises(imaplib.IMAP4.error):
+        mailbox.apply(7, Decision(labels=("Labels/JEV-REVIEW",), destination="Archive"))
+
+    server.add_flags.assert_not_called()
+    server.move.assert_not_called()
+
+
+def test_select_switches_the_folder_fetch_and_apply_operate_on():
+    server = MagicMock()
+
+    with _mailbox(server) as mailbox:
+        mailbox.select("Folders/Bay Bravo")
+
+    server.select_folder.assert_called_once_with("Folders/Bay Bravo")
+
+
+def test_ensure_folders_creates_only_missing_names_in_one_pass_in_order():
     server = _server(folders=("INBOX", "Labels/JEV-A"))
 
     with _mailbox(server) as mailbox:
-        mailbox.apply(1, Decision(labels=("Labels/JEV-A",), destination=None))
-        mailbox.apply(2, Decision(labels=("Labels/JEV-A", "Labels/JEV-B"), destination=None))
-        mailbox.apply(3, Decision(labels=("Labels/JEV-B",), destination=None))
+        mailbox.ensure_folders(["Labels/JEV-A", "Labels/JEV-B", "Archive", "Labels/JEV-B"])
 
     assert server.list_folders.call_count == 1
-    server.create_folder.assert_called_once_with("Labels/JEV-B")
+    assert server.mock_calls[:3] == [call.list_folders(), call.create_folder("Labels/JEV-B"), call.create_folder("Archive")]
+    assert server.create_folder.call_count == 2
 
 
-def test_create_folder_race_with_another_process_is_tolerated():
+def test_ensure_folders_tolerates_another_process_creating_the_folder_first():
     server = _server()
     server.create_folder.side_effect = imaplib.IMAP4.error("CREATE failed: Mailbox already exists")
     server.list_folders.side_effect = [
@@ -109,22 +124,18 @@ def test_create_folder_race_with_another_process_is_tolerated():
     ]
 
     with _mailbox(server) as mailbox:
-        mailbox.apply(9, Decision(labels=("Labels/JEV-SCAM",), destination=None))
+        mailbox.ensure_folders(["Labels/JEV-SCAM"])
+        assert mailbox.folder_exists("Labels/JEV-SCAM")
 
-    server.copy.assert_called_once_with([9], "Labels/JEV-SCAM")
-    server.add_flags.assert_called_once_with([9], [PROCESSED_KEYWORD])
     assert server.list_folders.call_count == 2
 
 
-def test_create_folder_failure_that_is_not_a_race_propagates():
+def test_ensure_folders_failure_that_is_not_a_race_propagates():
     server = _server()
     server.create_folder.side_effect = imaplib.IMAP4.error("a label cannot have children")
 
     with _mailbox(server) as mailbox, pytest.raises(imaplib.IMAP4.error):
-        mailbox.apply(9, Decision(labels=("Labels/JEV/X",), destination=None))
-
-    server.copy.assert_not_called()
-    server.add_flags.assert_not_called()
+        mailbox.ensure_folders(["Labels/JEV/X"])
 
 
 def test_context_manager_logs_out():
@@ -140,7 +151,7 @@ def test_starttls_connects_in_plaintext_then_upgrades_with_unverified_context(mo
     client_cls = MagicMock()
     monkeypatch.setattr("jev_mail.mailbox.IMAPClient", client_cls)
     config = MailboxConfig(
-        host="bridge", port=143, security="starttls", tls_verify=False, username="u", password="p", folder="Folders/Bay Bravo"
+        host="bridge", port=143, security="starttls", tls_verify=False, username="u", password="p"
     )
 
     with Mailbox(config):
@@ -152,7 +163,6 @@ def test_starttls_connects_in_plaintext_then_upgrades_with_unverified_context(mo
     assert context.check_hostname is False
     assert context.verify_mode == ssl.CERT_NONE
     server.login.assert_called_once_with("u", "p")
-    server.select_folder.assert_called_once_with("Folders/Bay Bravo")
 
 
 def test_ssl_connects_with_verifying_context_by_default(monkeypatch):

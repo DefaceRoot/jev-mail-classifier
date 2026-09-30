@@ -15,7 +15,7 @@ from jev_mail.providers.base import JevClient
 
 
 class MarkerNotSticking(Exception):
-    """The same UID came back as unprocessed after being handled."""
+    """The same (folder, UID) came back as unprocessed after being handled."""
 
 
 PROBE_KEYWORD = "$JevProbe"
@@ -30,8 +30,8 @@ def _paths(args: argparse.Namespace) -> tuple[Path, Path]:
 def _load(args: argparse.Namespace) -> AppConfig:
     config_path, env_path = _paths(args)
     config = load_config(config_path, env_path)
-    if args.folder:
-        config.mailbox.folder = args.folder
+    if args.folders:
+        config.mailbox.watch_folders = list(dict.fromkeys(args.folders))
     return config
 
 
@@ -64,13 +64,19 @@ def _log_line(mail: Email, decision: Decision, dry_run: bool) -> str:
 
 
 def _process_batch(
-    mailbox: Mailbox, client: JevClient, config: AppConfig, limit: int, dry_run: bool, done: set[int]
-) -> list[int]:
+    mailbox: Mailbox,
+    client: JevClient,
+    config: AppConfig,
+    folder: str,
+    limit: int,
+    dry_run: bool,
+    done: set[tuple[str, int]],
+) -> int:
     emails = mailbox.fetch_unprocessed(limit=limit)
-    repeated = sorted(done.intersection(mail.uid for mail in emails))
+    repeated = sorted(uid for uid in (mail.uid for mail in emails) if (folder, uid) in done)
     if repeated and not dry_run:
         raise MarkerNotSticking(
-            f"uids {repeated} are still unprocessed after being handled; the server isn't keeping "
+            f"{folder!r} uids {repeated} are still unprocessed after being handled; the server isn't keeping "
             f"{PROCESSED_KEYWORD} (run `jev-mail check`)"
         )
     for mail in emails:
@@ -78,8 +84,8 @@ def _process_batch(
         if not dry_run:
             mailbox.apply(mail.uid, decision)
         print(_log_line(mail, decision, dry_run), flush=True)
-        done.add(mail.uid)
-    return [mail.uid for mail in emails]
+        done.add((folder, mail.uid))
+    return len(emails)
 
 
 def _drain(
@@ -87,19 +93,21 @@ def _drain(
     client: JevClient,
     config: AppConfig,
     dry_run: bool,
+    done: set[tuple[str, int]],
     limit: int | None = None,
-    done: set[int] | None = None,
 ) -> None:
-    """Process batches until a short one. A dry run sets no markers, so it would
-    see the same mail forever: it handles exactly one batch. `done` holds UIDs
-    already handled; seeing one again means the server dropped our keyword, and
-    continuing would reclassify (and re-bill) the same mail forever."""
+    """Each watch folder in order: process batches until a short one. A dry run
+    sets no markers, so it would see the same mail forever: it handles exactly
+    one batch per folder. `done` holds (folder, uid) pairs already handled;
+    seeing one again means the server dropped our keyword, and continuing would
+    reclassify (and re-bill) the same mail forever."""
     batch_size = limit or config.mailbox.batch_size
-    done = set() if done is None else done
-    while True:
-        uids = _process_batch(mailbox, client, config, batch_size, dry_run, done)
-        if dry_run or len(uids) < batch_size:
-            return
+    for folder in config.mailbox.watch_folders:
+        mailbox.select(folder)
+        while True:
+            count = _process_batch(mailbox, client, config, folder, batch_size, dry_run, done)
+            if dry_run or count < batch_size:
+                break
 
 
 def _mailbox_error_message(exc: Exception, config: AppConfig) -> str:
@@ -125,7 +133,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         with Mailbox(config.mailbox) as mailbox:
-            _drain(mailbox, client, config, args.dry_run, args.limit)
+            if not args.dry_run:
+                mailbox.ensure_folders(config.writable_folders())
+            _drain(mailbox, client, config, args.dry_run, set(), args.limit)
     except (OSError, imaplib.IMAP4.error) as exc:
         print(f"error: {_mailbox_error_message(exc, config)}", file=sys.stderr)
         return 1
@@ -141,19 +151,22 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return 1
     config, client = started
 
-    print(f"watching {config.mailbox.folder!r}@{config.mailbox.host} (ctrl-c to stop)...", flush=True)
-    done: set[int] = set()
+    folders = config.mailbox.watch_folders
+    print(f"watching {folders} on {config.mailbox.host} (ctrl-c to stop)...", flush=True)
+    done: set[tuple[str, int]] = set()
     try:
         with Mailbox(config.mailbox) as mailbox:
-            _drain(mailbox, client, config, args.dry_run, done=done)
+            if not args.dry_run:
+                mailbox.ensure_folders(config.writable_folders())
             while True:
+                _drain(mailbox, client, config, args.dry_run, done)
+                mailbox.select(folders[0])
                 if mailbox.supports_idle():
                     mailbox.idle()
                     mailbox.idle_check(timeout=min(config.mailbox.poll_interval_seconds, MAX_IDLE_SECONDS))
                     mailbox.idle_done()
                 else:
                     time.sleep(min(config.mailbox.poll_interval_seconds, MAX_IDLE_SECONDS))
-                _drain(mailbox, client, config, args.dry_run, done=done)
     except (OSError, imaplib.IMAP4.error) as exc:
         print(f"error: {_mailbox_error_message(exc, config)}", file=sys.stderr)
         return 1
@@ -173,23 +186,32 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
     problems: list[str] = []
+    folders = config.mailbox.watch_folders
     probe_uid: int | None = None
     try:
         with Mailbox(config.mailbox) as mailbox:
-            print(f"connected to {config.mailbox.host}:{config.mailbox.port}, folder {config.mailbox.folder!r}")
+            print(f"connected to {config.mailbox.host}:{config.mailbox.port}")
             print(f"capabilities: {' '.join(mailbox.capabilities())}")
-            print(f"unprocessed messages: {len(mailbox.unprocessed_uids())}")
+            for folder in folders:
+                if not mailbox.folder_exists(folder):
+                    problems.append(f"watch folder {folder!r} does not exist on the server")
+                    continue
+                mailbox.select(folder)
+                print(f"{folder!r}: {len(mailbox.unprocessed_uids())} unprocessed messages")
             archive = config.mailbox.folders.get("archive")
             if archive is not None and not mailbox.folder_exists(archive):
                 problems.append(f"folders.archive {archive!r} does not exist on the server")
-            probe_uid = mailbox.newest_uid()
-            if probe_uid is None:
-                problems.append(f"{config.mailbox.folder!r} is empty, so keyword persistence can't be checked")
-            else:
-                mailbox.add_keyword(probe_uid, PROBE_KEYWORD)
+            if mailbox.folder_exists(folders[0]):
+                mailbox.select(folders[0])
+                probe_uid = mailbox.newest_uid()
+                if probe_uid is None:
+                    problems.append(f"{folders[0]!r} is empty, so keyword persistence can't be checked")
+                else:
+                    mailbox.add_keyword(probe_uid, PROBE_KEYWORD)
 
         if probe_uid is not None:
             with Mailbox(config.mailbox) as mailbox:
+                mailbox.select(folders[0])
                 try:
                     if PROBE_KEYWORD not in mailbox.keywords(probe_uid):
                         problems.append(
@@ -212,7 +234,12 @@ def cmd_check(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jev-mail", description="Label and sort your inbox with Jev.")
     parser.add_argument("--dir", default=".", help="directory holding config.yaml / .env (default: cwd)")
-    parser.add_argument("--folder", help="IMAP folder to process, overriding mailbox.folder (e.g. 'Folders/Bay Bravo')")
+    parser.add_argument(
+        "--folder",
+        dest="folders",
+        action="append",
+        help="IMAP folder to process, repeatable; replaces mailbox.watch_folders (e.g. 'Folders/Bay Bravo')",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="classify all unprocessed mail, then exit")

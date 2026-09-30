@@ -14,7 +14,9 @@ mailbox:
   tls_verify: false # default true; Bridge's certificate is self-signed
   username: ${IMAP_USERNAME}
   password: ${IMAP_PASSWORD}
-  folder: INBOX # override per process with `jev-mail --folder "Folders/Bay Bravo" watch`
+  # Folders one process covers. `watch` idles on the first and rechecks the rest every
+  # poll interval. Run ONE process per Proton account: concurrent writers deadlock Bridge.
+  watch_folders: [INBOX, "Folders/Bay Bravo"]
   batch_size: 25
   max_fetch_bytes: 524288 # partial fetch cap per message
   poll_interval_seconds: 600 # IDLE re-arm / fallback poll, capped at 600

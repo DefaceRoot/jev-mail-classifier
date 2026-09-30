@@ -27,7 +27,6 @@ def _connect(config: MailboxConfig) -> IMAPClient:
         server = IMAPClient(config.host, port=config.port, ssl=False, use_uid=True)
         server.starttls(context)
     server.login(config.username, config.password)
-    server.select_folder(config.folder)
     return server
 
 
@@ -54,6 +53,9 @@ class Mailbox:
                 self._server.logout()
             except Exception:
                 pass
+
+    def select(self, folder: str) -> None:
+        self._server.select_folder(folder)
 
     def capabilities(self) -> list[str]:
         return sorted(c.decode() if isinstance(c, bytes) else c for c in self._server.capabilities())
@@ -83,12 +85,28 @@ class Mailbox:
         marker only repeats them. The marker is set before the MOVE so a crash
         in between never leaves a moved message looking unprocessed."""
         for label in decision.labels:
-            self._ensure_folder(label)
             self._server.copy([uid], label)
         self._server.add_flags([uid], [PROCESSED_KEYWORD])
         if decision.destination:
-            self._ensure_folder(decision.destination)
             self._server.move([uid], decision.destination)
+
+    def ensure_folders(self, names: list[str]) -> None:
+        """Create the missing folders, one at a time, before any COPY or MOVE.
+        Proton Bridge deadlocks every later write on the account when label
+        creation overlaps other traffic (observed: a burst of label creates,
+        then UID COPY/MOVE hung until Bridge was restarted)."""
+        self._folder_names = None
+        for name in names:
+            if name in self._folders():
+                continue
+            try:
+                self._server.create_folder(name)
+            except imaplib.IMAP4.error:
+                self._folder_names = None
+                if name not in self._folders():
+                    raise
+                continue
+            self._folder_names.add(name)
 
     def folder_exists(self, name: str) -> bool:
         return name in self._folders()
@@ -111,19 +129,6 @@ class Mailbox:
         if self._folder_names is None:
             self._folder_names = {name for _, _, name in self._server.list_folders()}
         return self._folder_names
-
-    def _ensure_folder(self, name: str) -> None:
-        if name in self._folders():
-            return
-        try:
-            self._server.create_folder(name)
-        except imaplib.IMAP4.error:
-            # Another process on the same account may have created it first.
-            self._folder_names = None
-            if name not in self._folders():
-                raise
-            return
-        self._folder_names.add(name)
 
     def supports_idle(self) -> bool:
         return bool(self._server.has_capability("IDLE"))
