@@ -8,3 +8,4 @@ config.yaml
 .claude/
 brag-output/
 .DS_Store
+build/
